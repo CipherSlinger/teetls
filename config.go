@@ -56,8 +56,8 @@ func (c *Config) Validate() error {
 	}
 
 	if c.Mode == ModeStrict && !c.InsecureSkipAttestationVerify {
-		if len(c.ExpectedMeasurements) == 0 && c.EvidenceProvider == nil {
-			return errors.New("strict attestation mode requires either ExpectedMeasurements or EvidenceProvider")
+		if len(c.ExpectedMeasurements) == 0 && c.EvidenceProvider == nil && len(c.CertPEM) == 0 {
+			return errors.New("strict attestation mode requires either ExpectedMeasurements, EvidenceProvider, or CertPEM")
 		}
 	}
 
