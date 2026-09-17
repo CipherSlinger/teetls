@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/x509/pkix"
 	"testing"
+
+	"taa/pkg/csvattest"
 )
 
 func TestGenerateSM2CertificateWithEvidence(t *testing.T) {
@@ -40,8 +42,8 @@ func TestGenerateSM2CertificateWithEvidence(t *testing.T) {
 
 	// Check that UserData[0:32] matches SM3 of public key
 	pubDigest := ComputePublicKeySM3(cert.RawSubjectPublicKeyInfo)
-	if !bytes.Equal(ev.Report[128:160], pubDigest[:]) { // UserData offset in CSV report is 128
-		t.Errorf("public key SM3 digest does not match report UserData")
+	if !bytes.Equal(ev.Report[csvattest.OffsetUserData:csvattest.OffsetUserData+32], pubDigest[:]) {
+		t.Errorf("public key SM3 digest does not match report UserData at OffsetUserData (0x040)")
 	}
 }
 

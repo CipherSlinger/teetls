@@ -35,18 +35,17 @@ func NewMockEvidenceProvider() *MockEvidenceProvider {
 	}
 }
 
-// GetEvidence produces a simulated 2048-byte report with UserData at offset 128.
+// GetEvidence produces a simulated 2048-byte report with UserData and Measurement.
 func (m *MockEvidenceProvider) GetEvidence(pubKeyDigest [32]byte) (*CSVEvidenceExtension, error) {
 	report := make([]byte, 2048)
-	// Hygon CSV report specification: UserData is 64 bytes at offset 128 (0x80).
-	// Copy the 32-byte public key digest into report[128:160].
-	copy(report[128:160], pubKeyDigest[:])
+	// Hygon CSV report specification:
+	// OffsetUserData = 0x040 (decimal 64). Copy the 32-byte public key digest into report[0x040:0x060].
+	copy(report[csvattest.OffsetUserData:csvattest.OffsetUserData+32], pubKeyDigest[:])
 
-	// Populate measurement if available
+	// Populate measurement if available at OffsetMeasure (0x090, decimal 144).
 	measureBytes, err := hex.DecodeString(m.MeasurementHex)
 	if err == nil && len(measureBytes) == 32 {
-		// OffsetMeasure in Hygon CSV is offset 0x090 (144) or 160
-		copy(report[160:192], measureBytes)
+		copy(report[csvattest.OffsetMeasure:csvattest.OffsetMeasure+32], measureBytes)
 	}
 
 	return &CSVEvidenceExtension{
