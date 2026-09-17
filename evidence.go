@@ -12,10 +12,10 @@ var OIDCSVEvidence = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 58270, 1, 1}
 
 // CSVEvidenceExtension holds the attestation report and cert chain for CSV RA-TLS.
 type CSVEvidenceExtension struct {
-	Version    int    `asn1:"default:1"`
+	Version    int    `asn1:"optional,default:1"`
 	Report     []byte `asn1:"tag:0"`
-	HRKCert    []byte `asn1:"tag:1,optional"`
-	HSKCekCert []byte `asn1:"tag:2,optional"`
+	HRKCert    []byte `asn1:"tag:1,optional,omitempty"`
+	HSKCekCert []byte `asn1:"tag:2,optional,omitempty"`
 }
 
 // EncodeCSVEvidence encodes the evidence extension into a pkix.Extension.
@@ -23,7 +23,16 @@ func EncodeCSVEvidence(ev *CSVEvidenceExtension) (pkix.Extension, error) {
 	if ev == nil {
 		return pkix.Extension{}, errors.New("nil evidence extension")
 	}
-	val, err := asn1.Marshal(*ev)
+	if len(ev.Report) == 0 {
+		return pkix.Extension{}, errors.New("empty report in evidence extension")
+	}
+
+	evCopy := *ev
+	if evCopy.Version == 0 {
+		evCopy.Version = 1
+	}
+
+	val, err := asn1.Marshal(evCopy)
 	if err != nil {
 		return pkix.Extension{}, fmt.Errorf("marshal csv evidence: %w", err)
 	}

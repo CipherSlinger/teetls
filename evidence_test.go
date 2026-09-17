@@ -18,7 +18,7 @@ func TestCSVEvidenceExtension_EncodeDecode(t *testing.T) {
 		t.Fatalf("EncodeCSVEvidence failed: %v", err)
 	}
 
-	if ext.Id.String() != OIDCSVEvidence.String() {
+	if !ext.Id.Equal(OIDCSVEvidence) {
 		t.Fatalf("expected OID %s, got %s", OIDCSVEvidence, ext.Id)
 	}
 	if ext.Critical {
@@ -74,10 +74,36 @@ func TestCSVEvidenceExtension_OptionalFields(t *testing.T) {
 	}
 }
 
+func TestCSVEvidenceExtension_DefaultVersion(t *testing.T) {
+	// Version is omitted/0, should default to 1
+	orig := &CSVEvidenceExtension{
+		Report: bytes.Repeat([]byte{0xCC}, 2048),
+	}
+
+	ext, err := EncodeCSVEvidence(orig)
+	if err != nil {
+		t.Fatalf("EncodeCSVEvidence failed: %v", err)
+	}
+
+	decoded, err := DecodeCSVEvidence(ext.Value)
+	if err != nil {
+		t.Fatalf("DecodeCSVEvidence failed: %v", err)
+	}
+
+	if decoded.Version != 1 {
+		t.Errorf("expected version 1, got %d", decoded.Version)
+	}
+}
+
 func TestCSVEvidenceExtension_ErrorCases(t *testing.T) {
 	// Nil evidence
 	if _, err := EncodeCSVEvidence(nil); err == nil {
 		t.Errorf("expected error when encoding nil evidence, got nil")
+	}
+
+	// Empty report
+	if _, err := EncodeCSVEvidence(&CSVEvidenceExtension{Report: nil}); err == nil {
+		t.Errorf("expected error when encoding empty report, got nil")
 	}
 
 	// Invalid ASN.1 bytes
