@@ -10,14 +10,15 @@ import (
 	"time"
 
 	"github.com/tjfoc/gmsm/sm2"
+	"github.com/tjfoc/gmsm/sm3"
 	gx509 "github.com/tjfoc/gmsm/x509"
-
-	taacrypto "taa/pkg/crypto"
 )
 
 // ComputePublicKeySM3 computes the SM3 digest of a DER-encoded public key.
 func ComputePublicKeySM3(pubKeyDER []byte) [32]byte {
-	return taacrypto.SM3Sum(pubKeyDER)
+	var out [32]byte
+	copy(out[:], sm3.Sm3Sum(pubKeyDER))
+	return out
 }
 
 // ParseCertificatePEM parses a PEM-encoded certificate into a standard *cx509.Certificate.

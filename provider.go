@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"taa/pkg/csvattest"
+	"github.com/CipherSlinger/teetls/pkg/csvattest"
 )
 
 const (

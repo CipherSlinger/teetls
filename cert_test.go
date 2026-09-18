@@ -5,7 +5,7 @@ import (
 	"crypto/x509/pkix"
 	"testing"
 
-	"taa/pkg/csvattest"
+	"github.com/CipherSlinger/teetls/pkg/csvattest"
 )
 
 func TestGenerateSM2CertificateWithEvidence(t *testing.T) {

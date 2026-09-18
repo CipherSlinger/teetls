@@ -8,7 +8,7 @@ import (
 	"log"
 	"strings"
 
-	"taa/pkg/csvattest"
+	"github.com/CipherSlinger/teetls/pkg/csvattest"
 )
 
 var (
