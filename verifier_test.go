@@ -198,6 +198,46 @@ func TestVerifyPeerCertificate_InsecureSkip(t *testing.T) {
 	}
 }
 
+func TestVerifyPeerCertificate_InsecureSkip_WithoutEvidence(t *testing.T) {
+	priv, err := sm2.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate sm2 key: %v", err)
+	}
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, _ := rand.Int(rand.Reader, serialNumberLimit)
+	template := &gx509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: "Plain Certificate Without Evidence",
+		},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              gx509.KeyUsageDigitalSignature | gx509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []gx509.ExtKeyUsage{gx509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+	}
+
+	certPEM, err := gx509.CreateCertificateToPem(template, template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("create certificate pem: %v", err)
+	}
+
+	cfg := &Config{
+		Mode:                          ModeStrict,
+		InsecureSkipAttestationVerify: true,
+	}
+
+	evidence, err := VerifyPeerCertificateAndEvidence(certPEM, cfg)
+	if err != nil {
+		t.Fatalf("expected verify to pass without evidence when InsecureSkipAttestationVerify is true, got: %v", err)
+	}
+	if evidence != nil {
+		t.Fatal("expected nil evidence for plain certificate")
+	}
+}
+
 func TestConfig_Validate(t *testing.T) {
 	// Default mode and timeout
 	cfg := &Config{}

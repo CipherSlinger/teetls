@@ -63,6 +63,9 @@ func VerifyPeerCertificateAndEvidence(peerCertPEM []byte, cfg *Config) (*CSVEvid
 	}
 
 	if evidenceExtBytes == nil {
+		if cfg.InsecureSkipAttestationVerify {
+			return nil, nil
+		}
 		return nil, ErrMissingCSVEvidence
 	}
 
