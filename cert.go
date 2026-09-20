@@ -1,6 +1,7 @@
 package teetls
 
 import (
+	"context"
 	"crypto/rand"
 	cx509 "crypto/x509"
 	"crypto/x509/pkix"
@@ -34,8 +35,16 @@ func ParseCertificatePEM(certPEM []byte) (*cx509.Certificate, error) {
 // evidence binding the SM3 digest of the SM2 public key, and returns the PEM-encoded certificate
 // and private key.
 func GenerateSM2CertificateWithEvidence(provider EvidenceProvider) (certPEM []byte, keyPEM []byte, err error) {
+	return GenerateSM2CertificateWithEvidenceContext(context.Background(), provider)
+}
+
+// GenerateSM2CertificateWithEvidenceContext generates a certificate using cancellable evidence retrieval.
+func GenerateSM2CertificateWithEvidenceContext(ctx context.Context, provider EvidenceProvider) (certPEM []byte, keyPEM []byte, err error) {
 	if provider == nil {
 		return nil, nil, errors.New("nil evidence provider")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	// 1. Generate SM2 keypair
@@ -54,7 +63,7 @@ func GenerateSM2CertificateWithEvidence(provider EvidenceProvider) (certPEM []by
 	pubDigest := ComputePublicKeySM3(pubDER)
 
 	// 4. Retrieve attestation evidence from provider
-	evidence, err := provider.GetEvidence(pubDigest)
+	evidence, err := getEvidenceWithContext(ctx, provider, pubDigest)
 	if err != nil {
 		return nil, nil, fmt.Errorf("get attestation evidence: %w", err)
 	}
@@ -100,4 +109,27 @@ func GenerateSM2CertificateWithEvidence(provider EvidenceProvider) (certPEM []by
 	}
 
 	return certPEM, keyPEM, nil
+}
+
+func getEvidenceWithContext(ctx context.Context, provider EvidenceProvider, pubDigest [32]byte) (*CSVEvidenceExtension, error) {
+	if contextProvider, ok := provider.(ContextEvidenceProvider); ok {
+		return contextProvider.GetEvidenceContext(ctx, pubDigest)
+	}
+
+	type result struct {
+		evidence *CSVEvidenceExtension
+		err      error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		evidence, err := provider.GetEvidence(pubDigest)
+		ch <- result{evidence: evidence, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		return res.evidence, res.err
+	}
 }

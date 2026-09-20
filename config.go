@@ -1,6 +1,7 @@
 package teetls
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -41,9 +42,13 @@ type Config struct {
 	CertPEM []byte
 	KeyPEM  []byte
 
-	// HRKCertPath and HSKCekCertPath specify explicit paths to Hygon CA certificate chain.
+	// HRKCertPath and HSKCekCertPath specify explicit paths to the local Hygon certificate chain.
+	// HRKCertPath is the trusted root anchor; HSKCekCertPath is the intermediate bundle.
 	HRKCertPath    string
 	HSKCekCertPath string
+
+	// TrustedHRKCert contains an optional in-memory trusted HRK root anchor.
+	TrustedHRKCert []byte
 
 	// CertDir specifies a directory containing hrk.cert and hsk_cek.cert.
 	CertDir string
@@ -52,16 +57,25 @@ type Config struct {
 	// Defaults to 1 hour if <= 0.
 	CertCacheTTL time.Duration
 
-	certMu        sync.RWMutex
-	cachedCertPEM []byte
-	cachedKeyPEM  []byte
-	cachedAt      time.Time
+	certMu         sync.RWMutex
+	cachedCertPEM  []byte
+	cachedKeyPEM   []byte
+	cachedAt       time.Time
+	cachedNotAfter time.Time
 }
 
 // GetOrGenerateCertificate retrieves the cached certificate/key or generates a new one.
 func (c *Config) GetOrGenerateCertificate() ([]byte, []byte, error) {
+	return c.GetOrGenerateCertificateContext(context.Background())
+}
+
+// GetOrGenerateCertificateContext retrieves or generates a certificate with cancellable evidence retrieval.
+func (c *Config) GetOrGenerateCertificateContext(ctx context.Context) ([]byte, []byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if len(c.CertPEM) > 0 && len(c.KeyPEM) > 0 {
-		return c.CertPEM, c.KeyPEM, nil
+		return append([]byte(nil), c.CertPEM...), append([]byte(nil), c.KeyPEM...), nil
 	}
 
 	if c.EvidenceProvider == nil {
@@ -73,8 +87,9 @@ func (c *Config) GetOrGenerateCertificate() ([]byte, []byte, error) {
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
-	if len(c.cachedCertPEM) > 0 && len(c.cachedKeyPEM) > 0 && time.Since(c.cachedAt) < ttl {
-		certPEM, keyPEM := c.cachedCertPEM, c.cachedKeyPEM
+	if c.cachedCertificateValidLocked(ttl) {
+		certPEM := append([]byte(nil), c.cachedCertPEM...)
+		keyPEM := append([]byte(nil), c.cachedKeyPEM...)
 		c.certMu.RUnlock()
 		return certPEM, keyPEM, nil
 	}
@@ -82,19 +97,38 @@ func (c *Config) GetOrGenerateCertificate() ([]byte, []byte, error) {
 
 	c.certMu.Lock()
 	defer c.certMu.Unlock()
-	if len(c.cachedCertPEM) > 0 && len(c.cachedKeyPEM) > 0 && time.Since(c.cachedAt) < ttl {
-		return c.cachedCertPEM, c.cachedKeyPEM, nil
+	if c.cachedCertificateValidLocked(ttl) {
+		return append([]byte(nil), c.cachedCertPEM...), append([]byte(nil), c.cachedKeyPEM...), nil
 	}
 
-	certPEM, keyPEM, err := GenerateSM2CertificateWithEvidence(c.EvidenceProvider)
+	certPEM, keyPEM, err := GenerateSM2CertificateWithEvidenceContext(ctx, c.EvidenceProvider)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate certificate: %w", err)
 	}
 
-	c.cachedCertPEM = certPEM
-	c.cachedKeyPEM = keyPEM
+	cert, err := ParseCertificatePEM(certPEM)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse generated certificate: %w", err)
+	}
+
+	c.cachedCertPEM = append([]byte(nil), certPEM...)
+	c.cachedKeyPEM = append([]byte(nil), keyPEM...)
 	c.cachedAt = time.Now()
-	return certPEM, keyPEM, nil
+	c.cachedNotAfter = cert.NotAfter
+	return append([]byte(nil), certPEM...), append([]byte(nil), keyPEM...), nil
+}
+
+func (c *Config) cachedCertificateValidLocked(ttl time.Duration) bool {
+	if len(c.cachedCertPEM) == 0 || len(c.cachedKeyPEM) == 0 {
+		return false
+	}
+	if time.Since(c.cachedAt) >= ttl {
+		return false
+	}
+	if c.cachedNotAfter.IsZero() {
+		return false
+	}
+	return time.Now().Add(time.Minute).Before(c.cachedNotAfter)
 }
 
 // Validate validates the configuration and applies sensible defaults.
@@ -111,10 +145,12 @@ func (c *Config) Validate() error {
 		c.Timeout = 10 * time.Second
 	}
 
-	if c.Mode == ModeStrict && !c.InsecureSkipAttestationVerify {
-		if len(c.ExpectedMeasurements) == 0 && c.EvidenceProvider == nil && len(c.CertPEM) == 0 {
-			return errors.New("strict attestation mode requires either ExpectedMeasurements, EvidenceProvider, or CertPEM")
-		}
+	if (len(c.CertPEM) == 0) != (len(c.KeyPEM) == 0) {
+		return errors.New("teetls: CertPEM and KeyPEM must be configured together")
+	}
+
+	if (c.HRKCertPath == "") != (c.HSKCekCertPath == "") {
+		return errors.New("teetls: HRKCertPath and HSKCekCertPath must be configured together")
 	}
 
 	return nil

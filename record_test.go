@@ -10,7 +10,7 @@ import (
 
 func TestRecordLayer_SealAndUnseal(t *testing.T) {
 	key := []byte("0123456789abcdef") // 16 bytes for SM4
-	iv := []byte("123456789012")     // 12 bytes for GCM IV
+	iv := []byte("123456789012")      // 12 bytes for GCM IV
 
 	sender, err := NewRecordCipher(key, iv)
 	if err != nil {
@@ -316,7 +316,6 @@ func TestRecordLayer_DifferentRecordTypes(t *testing.T) {
 		recordType RecordType
 		data       []byte
 	}{
-		{RecordTypeChangeCipherSpec, []byte{0x01}},
 		{RecordTypeAlert, []byte{0x02, 0x0a}},
 		{RecordTypeHandshake, []byte{0x01, 0x00, 0x00, 0x08, 0xaa, 0xbb, 0xcc, 0xdd}},
 		{RecordTypeApplicationData, []byte("confidential application data")},
@@ -363,20 +362,15 @@ func TestRecordLayer_ResetAndSequence(t *testing.T) {
 	}
 
 	rc.Reset()
-	if rc.Sequence() != 0 {
-		t.Errorf("expected sequence 0 after reset, got %d", rc.Sequence())
+	if rc.Sequence() != 1 {
+		t.Errorf("expected sequence to remain 1 after disabled reset, got %d", rc.Sequence())
 	}
 
-	// Now that sequence is reset, unsealing rec1 (which was sealed with seq 0) should succeed!
-	ct, pt, err := rc.Unseal(rec1)
-	if err != nil {
-		t.Fatalf("unseal after reset: %v", err)
-	}
-	if ct != RecordTypeApplicationData || !bytes.Equal(pt, payload) {
-		t.Errorf("payload mismatch after reset")
+	if _, _, err := rc.Unseal(rec1); err == nil {
+		t.Fatalf("expected old sequence-zero record to fail after disabled reset")
 	}
 	if rc.Sequence() != 1 {
-		t.Errorf("expected sequence 1 after unseal, got %d", rc.Sequence())
+		t.Errorf("expected sequence to remain 1 after failed unseal, got %d", rc.Sequence())
 	}
 }
 

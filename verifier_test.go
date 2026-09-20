@@ -22,6 +22,7 @@ func TestVerifyPeerCertificate_Success(t *testing.T) {
 
 	cfg := &Config{
 		Mode:                 ModeStrict,
+		TrustedHRKCert:       mockProv.TrustedHRKCert(),
 		ExpectedMeasurements: []string{mockProv.GetMeasurementHex()},
 	}
 
@@ -46,6 +47,7 @@ func TestVerifyPeerCertificate_StrictVsPermissive(t *testing.T) {
 	// 1. Strict mode with wrong measurement -> must fail with ErrMeasurementMismatch
 	strictCfg := &Config{
 		Mode:                 ModeStrict,
+		TrustedHRKCert:       mockProv.TrustedHRKCert(),
 		ExpectedMeasurements: []string{wrongMeasurement},
 	}
 	_, err = VerifyPeerCertificateAndEvidence(certPEM, strictCfg)
@@ -59,6 +61,7 @@ func TestVerifyPeerCertificate_StrictVsPermissive(t *testing.T) {
 	// 2. Permissive mode with wrong measurement -> must succeed
 	permissiveCfg := &Config{
 		Mode:                 ModePermissive,
+		TrustedHRKCert:       mockProv.TrustedHRKCert(),
 		ExpectedMeasurements: []string{wrongMeasurement},
 	}
 	evidence, err := VerifyPeerCertificateAndEvidence(certPEM, permissiveCfg)
@@ -124,6 +127,7 @@ func TestVerifyPeerCertificate_PublicKeyBindingMismatch(t *testing.T) {
 
 	cfg := &Config{
 		Mode:                 ModeStrict,
+		TrustedHRKCert:       mockProv.TrustedHRKCert(),
 		ExpectedMeasurements: []string{mockProv.GetMeasurementHex()},
 	}
 
@@ -241,8 +245,14 @@ func TestVerifyPeerCertificate_InsecureSkip_WithoutEvidence(t *testing.T) {
 func TestConfig_Validate(t *testing.T) {
 	// Default mode and timeout
 	cfg := &Config{}
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("expected error in strict mode without ExpectedMeasurements or EvidenceProvider")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected structural default config to validate, got: %v", err)
+	}
+	if cfg.Mode != ModeStrict {
+		t.Fatalf("expected default ModeStrict, got: %s", cfg.Mode)
+	}
+	if cfg.Timeout != 10*time.Second {
+		t.Fatalf("expected default Timeout 10s, got: %v", cfg.Timeout)
 	}
 
 	mockProv := NewMockEvidenceProvider()
@@ -291,6 +301,7 @@ func TestVerifyPeerCertificate_StrictModeEmptyMeasurements(t *testing.T) {
 
 	cfg := &Config{
 		Mode:                 ModeStrict,
+		TrustedHRKCert:       mockProv.TrustedHRKCert(),
 		ExpectedMeasurements: nil,
 	}
 
@@ -341,6 +352,7 @@ func TestVerifyPeerCertificate_ExpiredCertificate(t *testing.T) {
 
 	cfg := &Config{
 		Mode:                 ModeStrict,
+		TrustedHRKCert:       mockProv.TrustedHRKCert(),
 		ExpectedMeasurements: []string{mockProv.GetMeasurementHex()},
 	}
 	_, err = VerifyPeerCertificateAndEvidence(certPEM, cfg)
@@ -390,6 +402,7 @@ func TestVerifyPeerCertificate_NotYetValidCertificate(t *testing.T) {
 
 	cfg := &Config{
 		Mode:                 ModeStrict,
+		TrustedHRKCert:       mockProv.TrustedHRKCert(),
 		ExpectedMeasurements: []string{mockProv.GetMeasurementHex()},
 	}
 	_, err = VerifyPeerCertificateAndEvidence(certPEM, cfg)
@@ -443,6 +456,7 @@ func TestVerifyPeerCertificate_TamperedPEKSignature(t *testing.T) {
 
 	cfg := &Config{
 		Mode:                 ModeStrict,
+		TrustedHRKCert:       mockProv.TrustedHRKCert(),
 		ExpectedMeasurements: []string{mockProv.GetMeasurementHex()},
 	}
 	_, err = VerifyPeerCertificateAndEvidence(certPEM, cfg)
@@ -495,6 +509,7 @@ func TestVerifyPeerCertificate_TamperedCertChain(t *testing.T) {
 
 	cfg := &Config{
 		Mode:                 ModeStrict,
+		TrustedHRKCert:       mockProv.TrustedHRKCert(),
 		ExpectedMeasurements: []string{mockProv.GetMeasurementHex()},
 	}
 	_, err = VerifyPeerCertificateAndEvidence(certPEM, cfg)

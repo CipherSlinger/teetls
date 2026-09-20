@@ -2,6 +2,7 @@ package teetls
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/hmac"
 	"crypto/rand"
@@ -66,6 +67,9 @@ type HandshakeResult struct {
 	PeerEvidence    *CSVEvidenceExtension
 	PeerCertificate *gx509.Certificate
 }
+
+// ErrMutualAttestationRequired indicates the server requires client attestation credentials.
+var ErrMutualAttestationRequired = errors.New("teetls: mutual attestation required")
 
 // encodeHandshakeMsg packs a handshake message with a 4-byte header: type (1 byte) + length (3 bytes).
 func encodeHandshakeMsg(msgType uint8, body []byte) []byte {
@@ -285,7 +289,11 @@ func computeHMACSM3(key, data []byte) []byte {
 
 // prepareServerCertificate resolves or generates server SM2 certificate and private key.
 func prepareServerCertificate(cfg *Config) (certPEM []byte, privKey *sm2.PrivateKey, err error) {
-	certPEM, keyPEM, err := cfg.GetOrGenerateCertificate()
+	return prepareServerCertificateContext(context.Background(), cfg)
+}
+
+func prepareServerCertificateContext(ctx context.Context, cfg *Config) (certPEM []byte, privKey *sm2.PrivateKey, err error) {
+	certPEM, keyPEM, err := cfg.GetOrGenerateCertificateContext(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("prepare server certificate: %w", err)
 	}
@@ -298,7 +306,11 @@ func prepareServerCertificate(cfg *Config) (certPEM []byte, privKey *sm2.Private
 
 // prepareClientCertificate resolves or generates client SM2 certificate and private key for mutual attestation.
 func prepareClientCertificate(cfg *Config) (certPEM []byte, privKey *sm2.PrivateKey, err error) {
-	certPEM, keyPEM, err := cfg.GetOrGenerateCertificate()
+	return prepareClientCertificateContext(context.Background(), cfg)
+}
+
+func prepareClientCertificateContext(ctx context.Context, cfg *Config) (certPEM []byte, privKey *sm2.PrivateKey, err error) {
+	certPEM, keyPEM, err := cfg.GetOrGenerateCertificateContext(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("prepare client certificate: %w", err)
 	}
@@ -311,6 +323,14 @@ func prepareClientCertificate(cfg *Config) (certPEM []byte, privKey *sm2.Private
 
 // ClientHandshake executes the client-side RFC 8998 TLS 1.3 handshake over rawConn.
 func ClientHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
+	return ClientHandshakeContext(context.Background(), rawConn, cfg)
+}
+
+// ClientHandshakeContext executes the client-side handshake with cancellable local operations.
+func ClientHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if cfg == nil {
 		cfg = &Config{}
 	}
@@ -402,6 +422,11 @@ func ClientHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 	}
 	transcript.Write(encodeHandshakeMsg(HandshakeTypeEncryptedExtensions, encExtensionsBody))
 
+	mutualRequired := len(encExtensionsBody) > 0 && encExtensionsBody[0] == 1
+	if mutualRequired && !cfg.VerifyMutualAttestation && cfg.EvidenceProvider == nil && (len(cfg.CertPEM) == 0 || len(cfg.KeyPEM) == 0) {
+		return nil, ErrMutualAttestationRequired
+	}
+
 	// 5. Read Certificate (encrypted)
 	msgType, certBody, err := readEncryptedHandshakeMsg(rawConn, serverHandshakeCipher)
 	if err != nil {
@@ -466,9 +491,9 @@ func ClientHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 	}
 	transcript.Write(encodeHandshakeMsg(HandshakeTypeFinished, finishedBody))
 
-	// 8. If mutual attestation is requested, send Client Certificate & CertificateVerify
-	if cfg.VerifyMutualAttestation {
-		clientCertPEM, clientPriv, err := prepareClientCertificate(cfg)
+	// 8. If mutual attestation is negotiated, send Client Certificate & CertificateVerify
+	if mutualRequired {
+		clientCertPEM, clientPriv, err := prepareClientCertificateContext(ctx, cfg)
 		if err != nil {
 			return nil, fmt.Errorf("teetls: prepare client certificate: %w", err)
 		}
@@ -526,6 +551,14 @@ func ClientHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 
 // ServerHandshake executes the server-side RFC 8998 TLS 1.3 handshake over rawConn.
 func ServerHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
+	return ServerHandshakeContext(context.Background(), rawConn, cfg)
+}
+
+// ServerHandshakeContext executes the server-side handshake with cancellable local operations.
+func ServerHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if cfg == nil {
 		cfg = &Config{}
 	}
@@ -534,7 +567,7 @@ func ServerHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 	}
 
 	// Prepare server SM2 certificate and private key
-	serverCertPEM, serverPriv, err := prepareServerCertificate(cfg)
+	serverCertPEM, serverPriv, err := prepareServerCertificateContext(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("teetls: prepare server certificate: %w", err)
 	}

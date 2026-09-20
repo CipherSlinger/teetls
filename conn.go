@@ -1,11 +1,16 @@
 package teetls
 
 import (
+	"context"
 	cx509 "crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,8 +18,8 @@ import (
 
 // Conn implements a net.Conn secured by RFC 8998 TLS 1.3 with CSV hardware attestation.
 type Conn struct {
-	rawConn net.Conn
-	cfg     *Config
+	rawConn  net.Conn
+	cfg      *Config
 	isServer bool
 
 	handshakeDone  atomic.Bool
@@ -24,15 +29,18 @@ type Conn struct {
 	inCipher  *RecordCipher
 	outCipher *RecordCipher
 
+	peerMu          sync.RWMutex
 	peerCertPEM     []byte
 	peerEvidence    *CSVEvidenceExtension
 	peerCertificate *cx509.Certificate
 
-	readBuf []byte
-	readMu  sync.Mutex
-	writeMu sync.Mutex
+	readBuf             []byte
+	readMu              sync.Mutex
+	writeMu             sync.Mutex
+	closeNotifyReceived atomic.Bool
 
 	closeOnce sync.Once
+	closeErr  error
 }
 
 // NewClientConn wraps an existing net.Conn as a client TEE-TLS connection.
@@ -55,6 +63,13 @@ func NewServerConn(rawConn net.Conn, cfg *Config) *Conn {
 
 // Handshake executes the RFC 8998 handshake if not already completed.
 func (c *Conn) Handshake() error {
+	return c.handshake(context.Background())
+}
+
+func (c *Conn) handshake(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if c.handshakeDone.Load() {
 		return nil
 	}
@@ -72,9 +87,9 @@ func (c *Conn) Handshake() error {
 	var res *HandshakeResult
 	var err error
 	if c.isServer {
-		res, err = ServerHandshake(c.rawConn, c.cfg)
+		res, err = ServerHandshakeContext(ctx, c.rawConn, c.cfg)
 	} else {
-		res, err = ClientHandshake(c.rawConn, c.cfg)
+		res, err = ClientHandshakeContext(ctx, c.rawConn, c.cfg)
 	}
 
 	if err != nil {
@@ -84,11 +99,13 @@ func (c *Conn) Handshake() error {
 
 	c.inCipher = res.InCipher
 	c.outCipher = res.OutCipher
-	c.peerCertPEM = res.PeerCertPEM
-	c.peerEvidence = res.PeerEvidence
+	c.peerMu.Lock()
+	c.peerCertPEM = append([]byte(nil), res.PeerCertPEM...)
+	c.peerEvidence = cloneEvidence(res.PeerEvidence)
 	if res.PeerCertificate != nil {
 		c.peerCertificate = res.PeerCertificate.ToX509Certificate()
 	}
+	c.peerMu.Unlock()
 
 	c.handshakeDone.Store(true)
 	return nil
@@ -98,6 +115,9 @@ func (c *Conn) Handshake() error {
 func (c *Conn) Read(b []byte) (int, error) {
 	if err := c.Handshake(); err != nil {
 		return 0, err
+	}
+	if len(b) == 0 {
+		return 0, nil
 	}
 
 	c.readMu.Lock()
@@ -114,6 +134,12 @@ func (c *Conn) Read(b []byte) (int, error) {
 	for {
 		header := make([]byte, RecordHeaderLen)
 		if _, err := io.ReadFull(c.rawConn, header); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				if c.closeNotifyReceived.Load() {
+					return 0, io.EOF
+				}
+				return 0, fmt.Errorf("teetls: connection closed without close_notify: %w", io.ErrUnexpectedEOF)
+			}
 			return 0, err
 		}
 
@@ -129,6 +155,9 @@ func (c *Conn) Read(b []byte) (int, error) {
 		fullRecord := make([]byte, RecordHeaderLen+payloadLen)
 		copy(fullRecord[:RecordHeaderLen], header)
 		if _, err := io.ReadFull(c.rawConn, fullRecord[RecordHeaderLen:]); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return 0, fmt.Errorf("teetls: truncated TLS record without close_notify: %w", io.ErrUnexpectedEOF)
+			}
 			return 0, err
 		}
 
@@ -138,18 +167,19 @@ func (c *Conn) Read(b []byte) (int, error) {
 		}
 
 		if recType == RecordTypeAlert {
-			if len(plaintext) >= 2 && plaintext[1] == 0 {
+			if len(plaintext) != 2 {
+				return 0, fmt.Errorf("teetls: malformed alert length %d", len(plaintext))
+			}
+			level, desc := plaintext[0], plaintext[1]
+			if level == 1 && desc == 0 {
+				c.closeNotifyReceived.Store(true)
 				return 0, io.EOF
 			}
-			if len(plaintext) >= 2 {
-				return 0, fmt.Errorf("teetls: received fatal alert (level %d, desc %d)", plaintext[0], plaintext[1])
-			}
-			return 0, io.EOF
+			return 0, fmt.Errorf("teetls: received alert (level %d, desc %d)", level, desc)
 		}
 
 		if recType != RecordTypeApplicationData {
-			// Ignore non-application data records or continue
-			continue
+			return 0, fmt.Errorf("teetls: unexpected post-handshake record type %d", recType)
 		}
 
 		if len(plaintext) == 0 {
@@ -201,22 +231,26 @@ func (c *Conn) Write(b []byte) (int, error) {
 
 // Close closes the underlying raw connection, transmitting a close_notify alert if handshake succeeded.
 func (c *Conn) Close() error {
-	var closeErr error
 	c.closeOnce.Do(func() {
+		var alertErr error
 		if c.handshakeDone.Load() && c.outCipher != nil {
 			c.writeMu.Lock()
-			// Alert record payload: Level (1 = warning), Description (0 = close_notify)
 			alertPayload := []byte{1, 0}
 			record, err := c.outCipher.Seal(RecordTypeAlert, alertPayload)
-			if err == nil {
-				_ = c.rawConn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
-				_, _ = c.rawConn.Write(record)
+			if err != nil {
+				alertErr = fmt.Errorf("teetls: seal close_notify: %w", err)
+			} else {
+				if err := c.rawConn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+					alertErr = fmt.Errorf("teetls: set close_notify deadline: %w", err)
+				} else if _, err := c.rawConn.Write(record); err != nil {
+					alertErr = fmt.Errorf("teetls: write close_notify: %w", err)
+				}
 			}
 			c.writeMu.Unlock()
 		}
-		closeErr = c.rawConn.Close()
+		c.closeErr = errors.Join(alertErr, c.rawConn.Close())
 	})
-	return closeErr
+	return c.closeErr
 }
 
 // LocalAddr returns the local network address.
@@ -246,17 +280,61 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 
 // PeerEvidence returns the peer's CSV attestation evidence extension.
 func (c *Conn) PeerEvidence() *CSVEvidenceExtension {
-	return c.peerEvidence
+	c.peerMu.RLock()
+	defer c.peerMu.RUnlock()
+	return cloneEvidence(c.peerEvidence)
 }
 
 // PeerCertificate returns the peer's parsed X.509 certificate.
 func (c *Conn) PeerCertificate() *cx509.Certificate {
-	return c.peerCertificate
+	c.peerMu.RLock()
+	defer c.peerMu.RUnlock()
+	if c.peerCertificate == nil {
+		return nil
+	}
+	cert := *c.peerCertificate
+	cert.Raw = append([]byte(nil), c.peerCertificate.Raw...)
+	cert.RawTBSCertificate = append([]byte(nil), c.peerCertificate.RawTBSCertificate...)
+	cert.RawSubjectPublicKeyInfo = append([]byte(nil), c.peerCertificate.RawSubjectPublicKeyInfo...)
+	cert.RawSubject = append([]byte(nil), c.peerCertificate.RawSubject...)
+	cert.RawIssuer = append([]byte(nil), c.peerCertificate.RawIssuer...)
+	cert.Signature = append([]byte(nil), c.peerCertificate.Signature...)
+	cert.DNSNames = append([]string(nil), c.peerCertificate.DNSNames...)
+	cert.EmailAddresses = append([]string(nil), c.peerCertificate.EmailAddresses...)
+	cert.IPAddresses = append([]net.IP(nil), c.peerCertificate.IPAddresses...)
+	cert.URIs = append([]*url.URL(nil), c.peerCertificate.URIs...)
+	cert.ExtKeyUsage = append([]cx509.ExtKeyUsage(nil), c.peerCertificate.ExtKeyUsage...)
+	cert.UnknownExtKeyUsage = append([]asn1.ObjectIdentifier(nil), c.peerCertificate.UnknownExtKeyUsage...)
+	cert.Extensions = append([]pkix.Extension(nil), c.peerCertificate.Extensions...)
+	cert.ExtraExtensions = append([]pkix.Extension(nil), c.peerCertificate.ExtraExtensions...)
+	cert.UnhandledCriticalExtensions = append([]asn1.ObjectIdentifier(nil), c.peerCertificate.UnhandledCriticalExtensions...)
+	cert.PolicyIdentifiers = append([]asn1.ObjectIdentifier(nil), c.peerCertificate.PolicyIdentifiers...)
+	cert.PermittedDNSDomains = append([]string(nil), c.peerCertificate.PermittedDNSDomains...)
+	cert.ExcludedDNSDomains = append([]string(nil), c.peerCertificate.ExcludedDNSDomains...)
+	cert.PermittedEmailAddresses = append([]string(nil), c.peerCertificate.PermittedEmailAddresses...)
+	cert.ExcludedEmailAddresses = append([]string(nil), c.peerCertificate.ExcludedEmailAddresses...)
+	cert.PermittedURIDomains = append([]string(nil), c.peerCertificate.PermittedURIDomains...)
+	cert.ExcludedURIDomains = append([]string(nil), c.peerCertificate.ExcludedURIDomains...)
+	return &cert
 }
 
 // PeerCertPEM returns the peer's raw PEM-encoded certificate.
 func (c *Conn) PeerCertPEM() []byte {
-	return c.peerCertPEM
+	c.peerMu.RLock()
+	defer c.peerMu.RUnlock()
+	return append([]byte(nil), c.peerCertPEM...)
+}
+
+func cloneEvidence(ev *CSVEvidenceExtension) *CSVEvidenceExtension {
+	if ev == nil {
+		return nil
+	}
+	return &CSVEvidenceExtension{
+		Version:    ev.Version,
+		Report:     append([]byte(nil), ev.Report...),
+		HRKCert:    append([]byte(nil), ev.HRKCert...),
+		HSKCekCert: append([]byte(nil), ev.HSKCekCert...),
+	}
 }
 
 // Ensure Conn implements net.Conn at compile time.

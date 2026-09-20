@@ -19,6 +19,13 @@ import (
 
 var DownloadCertFunc = DownloadCert
 
+var (
+	// ErrMissingCertChain indicates that chain verification was requested without local chain material.
+	ErrMissingCertChain = errors.New("missing CSV certificate chain")
+	// ErrUntrustedHRK indicates that peer HRK material does not match the trusted HRK anchor.
+	ErrUntrustedHRK = errors.New("untrusted HRK certificate")
+)
+
 type VerificationResult struct {
 	ReportSize        int
 	PubkeyDigest      []byte
@@ -107,12 +114,22 @@ func VerifyReport(reportFile string, verifyChain bool) (*VerificationResult, err
 
 // VerifyOptions controls attestation verification options including explicit cert paths.
 type VerifyOptions struct {
-	VerifyChain     bool
-	HRKCertPath     string
-	HSKCekCertPath  string
-	CertDir         string
-	HRKCertBytes    []byte
+	VerifyChain bool
+
+	// TrustedHRKCertBytes and TrustedHRKCertPath identify the local HRK trust anchor.
+	TrustedHRKCertBytes []byte
+	TrustedHRKCertPath  string
+
+	// HSKCekCertBytes and HSKCekCertPath identify the HSK/CEK intermediate bundle.
 	HSKCekCertBytes []byte
+	HSKCekCertPath  string
+
+	// CertDir specifies a local directory containing hrk.cert and hsk_cek.cert.
+	CertDir string
+
+	// HRKCertBytes and HRKCertPath are deprecated aliases for trusted HRK input.
+	HRKCertBytes []byte
+	HRKCertPath  string
 }
 
 // ParseReport parses an attestation report buffer into a VerificationResult.
@@ -228,23 +245,9 @@ func VerifyReportWithOptions(data []byte, opts VerifyOptions) (*VerificationResu
 		return res, nil
 	}
 
-	var certs *CertChainInput
-	if len(opts.HRKCertBytes) > 0 && len(opts.HSKCekCertBytes) > 0 {
-		certs = &CertChainInput{
-			HRK:    opts.HRKCertBytes,
-			HSKCEK: opts.HSKCekCertBytes,
-			Source: "in-memory bytes",
-		}
-	} else if opts.HRKCertPath != "" && opts.HSKCekCertPath != "" {
-		certs, err = LoadCertChainFromFiles(opts.HRKCertPath, opts.HSKCekCertPath)
-		if err != nil {
-			return res, fmt.Errorf("load certs from files: %w", err)
-		}
-	} else {
-		certs, err = loadCertChain(opts.CertDir, res.ChipIDASCII)
-		if err != nil {
-			return res, err
-		}
+	certs, err := loadChainFromOptions(opts, res.ChipIDASCII)
+	if err != nil {
+		return res, err
 	}
 
 	res.ChainSource = certs.Source
@@ -276,6 +279,43 @@ func VerifyReportData(data []byte, certDir string, verifyChain bool) (*Verificat
 	})
 }
 
+func loadChainFromOptions(opts VerifyOptions, chipIDASCII string) (*CertChainInput, error) {
+	trustedHRK := opts.TrustedHRKCertBytes
+	if len(trustedHRK) == 0 {
+		trustedHRK = opts.HRKCertBytes
+	}
+	trustedHRKPath := strings.TrimSpace(opts.TrustedHRKCertPath)
+	if trustedHRKPath == "" {
+		trustedHRKPath = strings.TrimSpace(opts.HRKCertPath)
+	}
+	hskCek := opts.HSKCekCertBytes
+	hskCekPath := strings.TrimSpace(opts.HSKCekCertPath)
+
+	if len(trustedHRK) > 0 || len(hskCek) > 0 {
+		if len(trustedHRK) == 0 || len(hskCek) == 0 {
+			return nil, fmt.Errorf("%w: trusted HRK and HSK/CEK bytes must be provided together", ErrMissingCertChain)
+		}
+		return &CertChainInput{
+			HRK:    append([]byte(nil), trustedHRK...),
+			HSKCEK: append([]byte(nil), hskCek...),
+			Source: "in-memory trusted HRK and HSK/CEK bytes",
+		}, nil
+	}
+
+	if trustedHRKPath != "" || hskCekPath != "" {
+		if trustedHRKPath == "" || hskCekPath == "" {
+			return nil, fmt.Errorf("%w: trusted HRK and HSK/CEK paths must be provided together", ErrMissingCertChain)
+		}
+		return LoadCertChainFromFiles(trustedHRKPath, hskCekPath)
+	}
+
+	if strings.TrimSpace(opts.CertDir) != "" {
+		return loadCertChain(opts.CertDir, chipIDASCII)
+	}
+
+	return nil, fmt.Errorf("%w: no trusted HRK and HSK/CEK material configured", ErrMissingCertChain)
+}
+
 // LoadCertChainFromFiles loads HRK and HSK/CEK certificates from explicit file paths.
 func LoadCertChainFromFiles(hrkPath, hskCekPath string) (*CertChainInput, error) {
 	hrk, err := readFixedFile(hrkPath, HrkCertSize)
@@ -290,23 +330,11 @@ func LoadCertChainFromFiles(hrkPath, hskCekPath string) (*CertChainInput, error)
 }
 
 func LoadCertChain(certDir string, chipIDASCII string) (*CertChainInput, error) {
-	hrkURL := HRKCertURL
-	hskCekURL := KDSCertURL + url.QueryEscape(chipIDASCII)
-	hrk, hrkErr := DownloadCertFunc(hrkURL, HrkCertSize)
-	hskCek, hskCekErr := DownloadCertFunc(hskCekURL, HskCekSize)
-	if hrkErr == nil && hskCekErr == nil {
-		return &CertChainInput{HRK: hrk, HSKCEK: hskCek, Source: "remote download", HRKURL: hrkURL, HSKCEKURL: hskCekURL}, nil
+	local, err := LoadLocalCertChain(certDir)
+	if err != nil {
+		return nil, fmt.Errorf("%w: local certificates unavailable (chip_id=%s): %v", ErrMissingCertChain, chipIDASCII, err)
 	}
-
-	local, localErr := LoadLocalCertChain(certDir)
-	if localErr == nil {
-		local.Source = "local file (fallback after remote download failed)"
-		local.DownloadNote = fmt.Sprintf("remote download failed: HRK=%v; HSK/CEK=%v", hrkErr, hskCekErr)
-		local.HRKURL = hrkURL
-		local.HSKCEKURL = hskCekURL
-		return local, nil
-	}
-	return nil, fmt.Errorf("failed to download certificates and local certificates unavailable (chip_id=%s): HRK download=%v; HSK/CEK download=%v; local=%v", chipIDASCII, hrkErr, hskCekErr, localErr)
+	return local, nil
 }
 
 // LoadLocalCertChain loads certificates from a directory containing hrk.cert and hsk_cek.cert.

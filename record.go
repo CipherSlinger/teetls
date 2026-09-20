@@ -60,6 +60,8 @@ var (
 	ErrNoContentType = errors.New("teetls: inner plaintext does not contain valid content type")
 	// ErrSequenceOverflow is returned when the 64-bit sequence number overflows.
 	ErrSequenceOverflow = errors.New("teetls: sequence number overflow")
+	// ErrInvalidInnerContentType is returned when decrypted TLSInnerPlaintext has an unsupported type.
+	ErrInvalidInnerContentType = errors.New("teetls: invalid inner plaintext content type")
 )
 
 // RecordCipher handles RFC 8998 TLS 1.3 record layer encryption and decryption using SM4-GCM.
@@ -103,11 +105,9 @@ func (rc *RecordCipher) Sequence() uint64 {
 	return rc.seq
 }
 
-// Reset resets the sequence number to zero.
+// Reset is deprecated and intentionally does nothing.
+// Resetting sequence numbers with the same SM4-GCM key/IV would reuse nonces.
 func (rc *RecordCipher) Reset() {
-	rc.mu.Lock()
-	defer rc.mu.Unlock()
-	rc.seq = 0
 }
 
 // Seal encrypts a plaintext payload with the specified ContentType, applying zero padding bytes.
@@ -227,6 +227,9 @@ func (rc *RecordCipher) Unseal(record []byte) (RecordType, []byte, error) {
 	}
 
 	realContentType := RecordType(decrypted[idx])
+	if realContentType != RecordTypeAlert && realContentType != RecordTypeHandshake && realContentType != RecordTypeApplicationData {
+		return 0, nil, ErrInvalidInnerContentType
+	}
 	plaintext := decrypted[:idx]
 
 	if len(plaintext) > MaxPlaintextLength {

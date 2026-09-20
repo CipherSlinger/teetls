@@ -3,14 +3,16 @@ package teetls
 import (
 	"bytes"
 	"testing"
+
+	"github.com/CipherSlinger/teetls/pkg/csvattest"
 )
 
 func TestCSVEvidenceExtension_EncodeDecode(t *testing.T) {
 	orig := &CSVEvidenceExtension{
 		Version:    1,
-		Report:     bytes.Repeat([]byte{0xAA}, 2048),
-		HRKCert:    []byte("fake-hrk-cert-bytes"),
-		HSKCekCert: []byte("fake-hsk-cek-cert-bytes"),
+		Report:     bytes.Repeat([]byte{0xAA}, csvattest.ReportSize),
+		HRKCert:    bytes.Repeat([]byte{0x11}, csvattest.HrkCertSize),
+		HSKCekCert: bytes.Repeat([]byte{0x22}, csvattest.HskCekSize),
 	}
 
 	ext, err := EncodeCSVEvidence(orig)
@@ -47,7 +49,7 @@ func TestCSVEvidenceExtension_EncodeDecode(t *testing.T) {
 func TestCSVEvidenceExtension_OptionalFields(t *testing.T) {
 	orig := &CSVEvidenceExtension{
 		Version: 1,
-		Report:  bytes.Repeat([]byte{0xBB}, 2048),
+		Report:  bytes.Repeat([]byte{0xBB}, csvattest.ReportSize),
 	}
 
 	ext, err := EncodeCSVEvidence(orig)
@@ -77,7 +79,7 @@ func TestCSVEvidenceExtension_OptionalFields(t *testing.T) {
 func TestCSVEvidenceExtension_DefaultVersion(t *testing.T) {
 	// Version is omitted/0, should default to 1
 	orig := &CSVEvidenceExtension{
-		Report: bytes.Repeat([]byte{0xCC}, 2048),
+		Report: bytes.Repeat([]byte{0xCC}, csvattest.ReportSize),
 	}
 
 	ext, err := EncodeCSVEvidence(orig)
@@ -106,6 +108,19 @@ func TestCSVEvidenceExtension_ErrorCases(t *testing.T) {
 		t.Errorf("expected error when encoding empty report, got nil")
 	}
 
+	// Invalid report size
+	if _, err := EncodeCSVEvidence(&CSVEvidenceExtension{Report: []byte{0x01, 0x02, 0x03}}); err == nil {
+		t.Errorf("expected error when encoding invalid report size, got nil")
+	}
+
+	// Invalid cert size
+	if _, err := EncodeCSVEvidence(&CSVEvidenceExtension{
+		Report:  bytes.Repeat([]byte{0x01}, csvattest.ReportSize),
+		HRKCert: []byte{0x01},
+	}); err == nil {
+		t.Errorf("expected error when encoding invalid HRK cert size, got nil")
+	}
+
 	// Invalid ASN.1 bytes
 	if _, err := DecodeCSVEvidence([]byte{0xFF, 0xFF}); err == nil {
 		t.Errorf("expected error when decoding invalid ASN.1 data, got nil")
@@ -114,7 +129,7 @@ func TestCSVEvidenceExtension_ErrorCases(t *testing.T) {
 	// Trailing bytes
 	valid := &CSVEvidenceExtension{
 		Version: 1,
-		Report:  []byte{0x01, 0x02, 0x03},
+		Report:  bytes.Repeat([]byte{0x01}, csvattest.ReportSize),
 	}
 	ext, err := EncodeCSVEvidence(valid)
 	if err != nil {

@@ -95,7 +95,7 @@ func DialContext(ctx context.Context, network, addr string, cfg *Config) (*Conn,
 	}()
 
 	conn := NewClientConn(rawConn, cfg)
-	if err := conn.Handshake(); err != nil {
+	if err := conn.handshake(ctx); err != nil {
 		conn.Close()
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("teetls: dial %s: %w", addr, ctx.Err())

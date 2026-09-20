@@ -1,6 +1,7 @@
 package teetls
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -21,23 +22,56 @@ type EvidenceProvider interface {
 	GetMeasurementHex() string
 }
 
+// ContextEvidenceProvider retrieves CSV attestation evidence with cancellation support.
+type ContextEvidenceProvider interface {
+	GetEvidenceContext(ctx context.Context, pubKeyDigest [32]byte) (*CSVEvidenceExtension, error)
+}
+
+// TrustedHRKProvider exposes locally trusted HRK material for test or offline configurations.
+type TrustedHRKProvider interface {
+	TrustedHRKCert() []byte
+}
+
 // MockEvidenceProvider implements EvidenceProvider for unit testing with cryptographically valid SM2-signed reports.
 type MockEvidenceProvider struct {
 	MeasurementHex string
 	HRKCert        []byte
 	HSKCekCert     []byte
+	authority      *csvattest.MockAttestationAuthority
+	initErr        error
 }
 
 // NewMockEvidenceProvider creates a new MockEvidenceProvider with default test data.
 func NewMockEvidenceProvider() *MockEvidenceProvider {
-	return &MockEvidenceProvider{
+	authority, err := csvattest.NewMockAttestationAuthority()
+	p := &MockEvidenceProvider{
 		MeasurementHex: DefaultMockMeasurementHex,
+		authority:      authority,
+		initErr:        err,
 	}
+	if authority != nil {
+		p.HRKCert = authority.HRKCert()
+		p.HSKCekCert = authority.HSKCekCert()
+	}
+	return p
 }
 
 // GetEvidence produces a cryptographically signed mock report with UserData, Measurement, and certificate chain.
 func (m *MockEvidenceProvider) GetEvidence(pubKeyDigest [32]byte) (*CSVEvidenceExtension, error) {
-	report, hrkCert, hskCekCert, err := csvattest.GenerateMockAttestationData(pubKeyDigest[:], m.MeasurementHex)
+	if m.initErr != nil {
+		return nil, fmt.Errorf("initialize mock attestation authority: %w", m.initErr)
+	}
+	if m.authority == nil {
+		authority, err := csvattest.NewMockAttestationAuthority()
+		if err != nil {
+			return nil, fmt.Errorf("initialize mock attestation authority: %w", err)
+		}
+		m.authority = authority
+		m.HRKCert = authority.HRKCert()
+		m.HSKCekCert = authority.HSKCekCert()
+	}
+
+	report, hrkCert, hskCekCert, err := m.authority.Generate(pubKeyDigest[:], m.MeasurementHex)
 	if err != nil {
 		return nil, fmt.Errorf("generate mock attestation data: %w", err)
 	}
@@ -48,6 +82,21 @@ func (m *MockEvidenceProvider) GetEvidence(pubKeyDigest [32]byte) (*CSVEvidenceE
 		HRKCert:    hrkCert,
 		HSKCekCert: hskCekCert,
 	}, nil
+}
+
+// GetEvidenceContext produces mock evidence and observes pre-call cancellation.
+func (m *MockEvidenceProvider) GetEvidenceContext(ctx context.Context, pubKeyDigest [32]byte) (*CSVEvidenceExtension, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	return m.GetEvidence(pubKeyDigest)
+}
+
+// TrustedHRKCert returns the mock HRK certificate that callers must trust explicitly.
+func (m *MockEvidenceProvider) TrustedHRKCert() []byte {
+	return append([]byte(nil), m.HRKCert...)
 }
 
 // GetMeasurementHex returns the mock measurement hex string.
@@ -72,6 +121,28 @@ func NewHygonHardwareProvider(devicePath, hrkPath, hskCekPath string) *HygonHard
 		HRKCertPath:    hrkPath,
 		HSKCekCertPath: hskCekPath,
 	}
+}
+
+// GetEvidenceContext communicates with the hardware driver to retrieve attestation report and cert chain.
+func (h *HygonHardwareProvider) GetEvidenceContext(ctx context.Context, pubKeyDigest [32]byte) (*CSVEvidenceExtension, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	return h.GetEvidence(pubKeyDigest)
+}
+
+// TrustedHRKCert returns configured local HRK material when available.
+func (h *HygonHardwareProvider) TrustedHRKCert() []byte {
+	if h.HRKCertPath == "" {
+		return nil
+	}
+	data, err := os.ReadFile(h.HRKCertPath)
+	if err != nil {
+		return nil
+	}
+	return append([]byte(nil), data...)
 }
 
 // GetEvidence communicates with the hardware driver to retrieve attestation report and cert chain.

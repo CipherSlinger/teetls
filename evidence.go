@@ -5,6 +5,8 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
+
+	"github.com/CipherSlinger/teetls/pkg/csvattest"
 )
 
 // OIDCSVEvidence is the registered ASN.1 Object Identifier for Hygon CSV RA-TLS evidence.
@@ -20,11 +22,8 @@ type CSVEvidenceExtension struct {
 
 // EncodeCSVEvidence encodes the evidence extension into a pkix.Extension.
 func EncodeCSVEvidence(ev *CSVEvidenceExtension) (pkix.Extension, error) {
-	if ev == nil {
-		return pkix.Extension{}, errors.New("nil evidence extension")
-	}
-	if len(ev.Report) == 0 {
-		return pkix.Extension{}, errors.New("empty report in evidence extension")
+	if err := validateEvidenceExtension(ev); err != nil {
+		return pkix.Extension{}, err
 	}
 
 	evCopy := *ev
@@ -53,5 +52,24 @@ func DecodeCSVEvidence(data []byte) (*CSVEvidenceExtension, error) {
 	if len(rest) > 0 {
 		return nil, errors.New("trailing bytes in csv evidence extension")
 	}
+	if err := validateEvidenceExtension(&ev); err != nil {
+		return nil, err
+	}
 	return &ev, nil
+}
+
+func validateEvidenceExtension(ev *CSVEvidenceExtension) error {
+	if ev == nil {
+		return errors.New("nil evidence extension")
+	}
+	if len(ev.Report) != csvattest.ReportSize {
+		return fmt.Errorf("invalid report size in evidence extension: got %d, want %d", len(ev.Report), csvattest.ReportSize)
+	}
+	if len(ev.HRKCert) > 0 && len(ev.HRKCert) != csvattest.HrkCertSize {
+		return fmt.Errorf("invalid HRK cert size in evidence extension: got %d, want %d", len(ev.HRKCert), csvattest.HrkCertSize)
+	}
+	if len(ev.HSKCekCert) > 0 && len(ev.HSKCekCert) != csvattest.HskCekSize {
+		return fmt.Errorf("invalid HSK/CEK cert size in evidence extension: got %d, want %d", len(ev.HSKCekCert), csvattest.HskCekSize)
+	}
+	return nil
 }

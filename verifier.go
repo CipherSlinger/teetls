@@ -32,13 +32,51 @@ var (
 	ErrCertificateNotYetValid = errors.New("peer certificate is not yet valid")
 )
 
+func normalizedVerifyConfig(cfg *Config) (*Config, error) {
+	if cfg == nil {
+		cfg = &Config{}
+	}
+	copyCfg := Config{
+		Mode:                          cfg.Mode,
+		EvidenceProvider:              cfg.EvidenceProvider,
+		ExpectedMeasurements:          append([]string(nil), cfg.ExpectedMeasurements...),
+		VerifyMutualAttestation:       cfg.VerifyMutualAttestation,
+		Timeout:                       cfg.Timeout,
+		InsecureSkipAttestationVerify: cfg.InsecureSkipAttestationVerify,
+		CertPEM:                       append([]byte(nil), cfg.CertPEM...),
+		KeyPEM:                        append([]byte(nil), cfg.KeyPEM...),
+		HRKCertPath:                   cfg.HRKCertPath,
+		HSKCekCertPath:                cfg.HSKCekCertPath,
+		TrustedHRKCert:                append([]byte(nil), cfg.TrustedHRKCert...),
+		CertDir:                       cfg.CertDir,
+		CertCacheTTL:                  cfg.CertCacheTTL,
+	}
+	if copyCfg.Mode == "" {
+		copyCfg.Mode = ModeStrict
+	}
+	if copyCfg.Mode != ModeStrict && copyCfg.Mode != ModePermissive {
+		return nil, fmt.Errorf("invalid attestation mode: %q", copyCfg.Mode)
+	}
+	if (copyCfg.HRKCertPath == "") != (copyCfg.HSKCekCertPath == "") {
+		return nil, errors.New("teetls: HRKCertPath and HSKCekCertPath must be configured together")
+	}
+	if len(copyCfg.TrustedHRKCert) == 0 {
+		if provider, ok := copyCfg.EvidenceProvider.(TrustedHRKProvider); ok {
+			copyCfg.TrustedHRKCert = provider.TrustedHRKCert()
+		}
+	}
+	return &copyCfg, nil
+}
+
 // VerifyPeerCertificateAndEvidence parses the peer certificate, extracts the CSV attestation
 // evidence extension, verifies cryptographic binding to the peer public key, and verifies
 // enclave measurement against the configured policy.
 func VerifyPeerCertificateAndEvidence(peerCertPEM []byte, cfg *Config) (*CSVEvidenceExtension, error) {
-	if cfg == nil {
-		cfg = &Config{Mode: ModeStrict}
+	vcfg, err := normalizedVerifyConfig(cfg)
+	if err != nil {
+		return nil, err
 	}
+	cfg = vcfg
 
 	cert, err := ParseCertificatePEM(peerCertPEM)
 	if err != nil {
@@ -78,20 +116,24 @@ func VerifyPeerCertificateAndEvidence(peerCertPEM []byte, cfg *Config) (*CSVEvid
 		return evidence, nil
 	}
 
-	// 1. Verify PEK report signature and certificate chain
+	// 1. Verify PEK report signature and certificate chain.
 	opts := csvattest.VerifyOptions{
 		VerifyChain: true,
+		CertDir:     cfg.CertDir,
 	}
-	if len(evidence.HRKCert) > 0 && len(evidence.HSKCekCert) > 0 {
-		opts.HRKCertBytes = evidence.HRKCert
-		opts.HSKCekCertBytes = evidence.HSKCekCert
-	} else if cfg.HRKCertPath != "" && cfg.HSKCekCertPath != "" {
-		opts.HRKCertPath = cfg.HRKCertPath
+	if len(cfg.TrustedHRKCert) > 0 {
+		opts.TrustedHRKCertBytes = cfg.TrustedHRKCert
+		if len(evidence.HRKCert) > 0 && !bytes.Equal(evidence.HRKCert, cfg.TrustedHRKCert) {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidEvidenceReport, csvattest.ErrUntrustedHRK)
+		}
+	}
+	if cfg.HRKCertPath != "" && cfg.HSKCekCertPath != "" {
+		opts.TrustedHRKCertPath = cfg.HRKCertPath
 		opts.HSKCekCertPath = cfg.HSKCekCertPath
-	} else if cfg.CertDir != "" {
-		opts.CertDir = cfg.CertDir
-	} else {
-		opts.VerifyChain = false
+	} else if len(evidence.HSKCekCert) > 0 {
+		opts.HSKCekCertBytes = evidence.HSKCekCert
+	} else if len(cfg.TrustedHRKCert) > 0 && len(evidence.HRKCert) > 0 && len(evidence.HSKCekCert) == 0 {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidEvidenceReport, csvattest.ErrMissingCertChain)
 	}
 
 	res, err := csvattest.VerifyReportWithOptions(evidence.Report, opts)
