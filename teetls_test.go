@@ -2,6 +2,7 @@ package teetls
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/x509/pkix"
 	"errors"
@@ -516,5 +517,206 @@ func TestTEETLS_ConnDeadlines(t *testing.T) {
 	var netErr net.Error
 	if !errors.As(err, &netErr) || !netErr.Timeout() {
 		t.Fatalf("expected net timeout error, got: %v", err)
+	}
+}
+
+// TestTEETLS_KeyScheduleSeparationAndSequence verifies that handshake and application traffic keys
+// are cryptographically distinct and that application ciphers start sequence numbers at 0.
+func TestTEETLS_KeyScheduleSeparationAndSequence(t *testing.T) {
+	sharedSecret := bytes.Repeat([]byte{0x42}, 32)
+	clientRandom := bytes.Repeat([]byte{0x01}, 32)
+	serverRandom := bytes.Repeat([]byte{0x02}, 32)
+	transcriptHash := bytes.Repeat([]byte{0x03}, 32)
+
+	hsKeys, err := deriveHandshakeTrafficKeys(sharedSecret, clientRandom, serverRandom)
+	if err != nil {
+		t.Fatalf("deriveHandshakeTrafficKeys failed: %v", err)
+	}
+
+	appKeys, err := deriveApplicationTrafficKeys(sharedSecret, transcriptHash)
+	if err != nil {
+		t.Fatalf("deriveApplicationTrafficKeys failed: %v", err)
+	}
+
+	// Verify keys are completely distinct
+	if bytes.Equal(hsKeys.ClientWriteKey, appKeys.ClientWriteKey) {
+		t.Fatal("handshake and application client write keys must not match")
+	}
+	if bytes.Equal(hsKeys.ClientWriteIV, appKeys.ClientWriteIV) {
+		t.Fatal("handshake and application client write IVs must not match")
+	}
+	if bytes.Equal(hsKeys.ServerWriteKey, appKeys.ServerWriteKey) {
+		t.Fatal("handshake and application server write keys must not match")
+	}
+	if bytes.Equal(hsKeys.ServerWriteIV, appKeys.ServerWriteIV) {
+		t.Fatal("handshake and application server write IVs must not match")
+	}
+
+	// Verify application cipher starts at sequence number 0
+	appCipher, err := NewRecordCipher(appKeys.ClientWriteKey, appKeys.ClientWriteIV)
+	if err != nil {
+		t.Fatalf("NewRecordCipher failed: %v", err)
+	}
+	if appCipher.Sequence() != 0 {
+		t.Fatalf("expected initial sequence number 0, got %d", appCipher.Sequence())
+	}
+}
+
+// TestTEETLS_DialContextTimeoutOnHungServer verifies that DialContext aborts when the server hangs.
+func TestTEETLS_DialContextTimeoutOnHungServer(t *testing.T) {
+	mockProv := NewMockEvidenceProvider()
+	clientCfg := &Config{
+		Mode:                 ModeStrict,
+		EvidenceProvider:     mockProv,
+		ExpectedMeasurements: []string{mockProv.GetMeasurementHex()},
+	}
+
+	// Plain TCP listener that accepts but never responds
+	rawListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer rawListener.Close()
+
+	go func() {
+		for {
+			conn, err := rawListener.Accept()
+			if err != nil {
+				return
+			}
+			// Hang the connection
+			defer conn.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err = DialContext(ctx, "tcp", rawListener.Addr().String(), clientCfg)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected DialContext to fail on hung server, got nil")
+	}
+	if elapsed > 1*time.Second {
+		t.Fatalf("DialContext took too long to abort (%v), deadline not respected", elapsed)
+	}
+}
+
+// TestTEETLS_GracefulCloseNotify verifies that Conn.Close() sends close_notify and peer reads io.EOF.
+func TestTEETLS_GracefulCloseNotify(t *testing.T) {
+	mockProv := NewMockEvidenceProvider()
+
+	serverCfg := &Config{
+		Mode:             ModeStrict,
+		EvidenceProvider: mockProv,
+	}
+	clientCfg := &Config{
+		Mode:             ModeStrict,
+		EvidenceProvider: mockProv,
+		ExpectedMeasurements: []string{
+			mockProv.GetMeasurementHex(),
+		},
+	}
+
+	listener, err := Listen("tcp", "127.0.0.1:0", serverCfg)
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		// Read one message from client
+		buf := make([]byte, 32)
+		n, err := conn.Read(buf)
+		if err != nil || string(buf[:n]) != "ping" {
+			conn.Close()
+			return
+		}
+		// Gracefully close
+		_ = conn.Close()
+	}()
+
+	clientConn, err := Dial("tcp", listener.Addr().String(), clientCfg)
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	if _, err := clientConn.Write([]byte("ping")); err != nil {
+		t.Fatalf("client write failed: %v", err)
+	}
+
+	buf := make([]byte, 32)
+	_, err = clientConn.Read(buf)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected io.EOF on server close_notify, got: %v", err)
+	}
+
+	<-serverDone
+}
+
+// TestTEETLS_ServerCertCache verifies that server caches and reuses ephemeral certificates.
+func TestTEETLS_ServerCertCache(t *testing.T) {
+	mockProv := NewMockEvidenceProvider()
+
+	serverCfg := &Config{
+		Mode:             ModeStrict,
+		EvidenceProvider: mockProv,
+		CertCacheTTL:     10 * time.Minute,
+	}
+	clientCfg := &Config{
+		Mode:             ModeStrict,
+		EvidenceProvider: mockProv,
+		ExpectedMeasurements: []string{
+			mockProv.GetMeasurementHex(),
+		},
+	}
+
+	listener, err := Listen("tcp", "127.0.0.1:0", serverCfg)
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 16)
+				n, _ := c.Read(buf)
+				_, _ = c.Write(buf[:n])
+			}(conn)
+		}
+	}()
+
+	// Connect first client
+	c1, err := Dial("tcp", listener.Addr().String(), clientCfg)
+	if err != nil {
+		t.Fatalf("Dial c1 failed: %v", err)
+	}
+	defer c1.Close()
+
+	// Connect second client
+	c2, err := Dial("tcp", listener.Addr().String(), clientCfg)
+	if err != nil {
+		t.Fatalf("Dial c2 failed: %v", err)
+	}
+	defer c2.Close()
+
+	// Certificates presented to c1 and c2 must be identical due to cache
+	if !bytes.Equal(c1.PeerCertPEM(), c2.PeerCertPEM()) {
+		t.Fatal("expected cached certificate to be reused across connections")
 	}
 }

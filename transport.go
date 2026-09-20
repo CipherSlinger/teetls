@@ -56,6 +56,9 @@ func DialContext(ctx context.Context, network, addr string, cfg *Config) (*Conn,
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("teetls: invalid dial config: %w", err)
 	}
+	if cfg.Mode == ModeStrict && !cfg.InsecureSkipAttestationVerify && len(cfg.ExpectedMeasurements) == 0 {
+		return nil, fmt.Errorf("teetls: client dialing in strict mode requires ExpectedMeasurements")
+	}
 
 	var d net.Dialer
 	if cfg.Timeout > 0 {
@@ -67,12 +70,40 @@ func DialContext(ctx context.Context, network, addr string, cfg *Config) (*Conn,
 		return nil, fmt.Errorf("teetls: dial %s: %w", addr, err)
 	}
 
+	var deadline time.Time
+	if d, ok := ctx.Deadline(); ok {
+		deadline = d
+	}
+	if cfg.Timeout > 0 {
+		timeoutDeadline := time.Now().Add(cfg.Timeout)
+		if deadline.IsZero() || timeoutDeadline.Before(deadline) {
+			deadline = timeoutDeadline
+		}
+	}
+	if !deadline.IsZero() {
+		_ = rawConn.SetDeadline(deadline)
+	}
+
+	ctxDone := make(chan struct{})
+	defer close(ctxDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = rawConn.SetDeadline(time.Now())
+		case <-ctxDone:
+		}
+	}()
+
 	conn := NewClientConn(rawConn, cfg)
 	if err := conn.Handshake(); err != nil {
 		conn.Close()
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("teetls: dial %s: %w", addr, ctx.Err())
+		}
 		return nil, fmt.Errorf("teetls: handshake failed: %w", err)
 	}
 
+	_ = rawConn.SetDeadline(time.Time{})
 	return conn, nil
 }
 

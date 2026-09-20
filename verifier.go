@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/CipherSlinger/teetls/pkg/csvattest"
 )
@@ -23,6 +24,12 @@ var (
 
 	// ErrInvalidEvidenceReport indicates that the CSV attestation report data is corrupted or invalid.
 	ErrInvalidEvidenceReport = errors.New("invalid or corrupted CSV attestation report")
+
+	// ErrCertificateExpired indicates that the peer certificate has expired.
+	ErrCertificateExpired = errors.New("peer certificate has expired")
+
+	// ErrCertificateNotYetValid indicates that the peer certificate is not yet valid.
+	ErrCertificateNotYetValid = errors.New("peer certificate is not yet valid")
 )
 
 // VerifyPeerCertificateAndEvidence parses the peer certificate, extracts the CSV attestation
@@ -36,6 +43,15 @@ func VerifyPeerCertificateAndEvidence(peerCertPEM []byte, cfg *Config) (*CSVEvid
 	cert, err := ParseCertificatePEM(peerCertPEM)
 	if err != nil {
 		return nil, fmt.Errorf("parse peer certificate: %w", err)
+	}
+
+	// 0. Verify certificate validity period
+	now := time.Now()
+	if now.Before(cert.NotBefore) {
+		return nil, fmt.Errorf("%w: not valid before %s (current time %s)", ErrCertificateNotYetValid, cert.NotBefore, now)
+	}
+	if now.After(cert.NotAfter) {
+		return nil, fmt.Errorf("%w: expired at %s (current time %s)", ErrCertificateExpired, cert.NotAfter, now)
 	}
 
 	var evidenceExtBytes []byte
@@ -59,59 +75,40 @@ func VerifyPeerCertificateAndEvidence(peerCertPEM []byte, cfg *Config) (*CSVEvid
 		return evidence, nil
 	}
 
-	// 1. Cryptographic Public Key Binding Check
+	// 1. Verify PEK report signature and certificate chain
+	opts := csvattest.VerifyOptions{
+		VerifyChain: true,
+	}
+	if len(evidence.HRKCert) > 0 && len(evidence.HSKCekCert) > 0 {
+		opts.HRKCertBytes = evidence.HRKCert
+		opts.HSKCekCertBytes = evidence.HSKCekCert
+	} else if cfg.HRKCertPath != "" && cfg.HSKCekCertPath != "" {
+		opts.HRKCertPath = cfg.HRKCertPath
+		opts.HSKCekCertPath = cfg.HSKCekCertPath
+	} else if cfg.CertDir != "" {
+		opts.CertDir = cfg.CertDir
+	} else {
+		opts.VerifyChain = false
+	}
+
+	res, err := csvattest.VerifyReportWithOptions(evidence.Report, opts)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidEvidenceReport, err)
+	}
+
+	// 2. Cryptographic Public Key Binding Check
 	pubDigest := ComputePublicKeySM3(cert.RawSubjectPublicKeyInfo)
-	var matchedBinding bool
-
-	// Check 1: Check report at OffsetUserData (0x040)
-	if len(evidence.Report) >= csvattest.OffsetUserData+32 &&
-		bytes.Equal(evidence.Report[csvattest.OffsetUserData:csvattest.OffsetUserData+32], pubDigest[:]) {
-		matchedBinding = true
-	}
-
-	// Check 2: Check report at legacy offset 128 (0x080) for custom mock compatibility
-	if !matchedBinding && len(evidence.Report) >= 128+32 &&
-		bytes.Equal(evidence.Report[128:160], pubDigest[:]) {
-		matchedBinding = true
-	}
-
-	// Check 3: Check via csvattest.ParseReport if report length >= ReportSize
-	if !matchedBinding && len(evidence.Report) >= csvattest.ReportSize {
-		res, err := csvattest.ParseReport(evidence.Report)
-		if err == nil && len(res.UserData) >= 32 && bytes.Equal(res.UserData[:32], pubDigest[:]) {
-			matchedBinding = true
-		}
-	}
-
-	if !matchedBinding {
+	if len(res.UserData) < 32 || !bytes.Equal(res.UserData[:32], pubDigest[:]) {
 		return nil, fmt.Errorf("%w: expected %x", ErrPublicKeyBindingMismatch, pubDigest)
 	}
 
-	// 2. Measurement Check
+	// 3. Measurement Check
+	if cfg.Mode == ModeStrict && len(cfg.ExpectedMeasurements) == 0 {
+		return nil, fmt.Errorf("%w: strict mode requires non-empty ExpectedMeasurements", ErrMeasurementMismatch)
+	}
+
 	if len(cfg.ExpectedMeasurements) > 0 {
-		var extractedMeas []byte
-
-		// Try ParseReport first
-		if len(evidence.Report) >= csvattest.ReportSize {
-			if res, err := csvattest.ParseReport(evidence.Report); err == nil && len(res.Digest) == 32 {
-				extractedMeas = res.Digest
-			}
-		}
-
-		// Fallback: direct offset extraction
-		if len(extractedMeas) == 0 {
-			if len(evidence.Report) >= csvattest.OffsetMeasure+32 {
-				extractedMeas = evidence.Report[csvattest.OffsetMeasure : csvattest.OffsetMeasure+32]
-			} else if len(evidence.Report) >= 160+32 {
-				extractedMeas = evidence.Report[160:192]
-			}
-		}
-
-		if len(extractedMeas) < 32 {
-			return nil, fmt.Errorf("%w: report too short to extract measurement", ErrInvalidEvidenceReport)
-		}
-
-		hexMeas := strings.ToLower(hex.EncodeToString(extractedMeas))
+		hexMeas := strings.ToLower(hex.EncodeToString(res.Digest))
 		var measMatched bool
 		for _, exp := range cfg.ExpectedMeasurements {
 			if strings.EqualFold(exp, hexMeas) {

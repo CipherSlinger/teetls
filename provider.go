@@ -1,8 +1,10 @@
 package teetls
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/CipherSlinger/teetls/pkg/csvattest"
@@ -19,7 +21,7 @@ type EvidenceProvider interface {
 	GetMeasurementHex() string
 }
 
-// MockEvidenceProvider implements EvidenceProvider for unit testing.
+// MockEvidenceProvider implements EvidenceProvider for unit testing with cryptographically valid SM2-signed reports.
 type MockEvidenceProvider struct {
 	MeasurementHex string
 	HRKCert        []byte
@@ -30,29 +32,21 @@ type MockEvidenceProvider struct {
 func NewMockEvidenceProvider() *MockEvidenceProvider {
 	return &MockEvidenceProvider{
 		MeasurementHex: DefaultMockMeasurementHex,
-		HRKCert:        []byte("mock-hrk-cert-bytes"),
-		HSKCekCert:     []byte("mock-hsk-cek-cert-bytes"),
 	}
 }
 
-// GetEvidence produces a simulated 2048-byte report with UserData and Measurement.
+// GetEvidence produces a cryptographically signed mock report with UserData, Measurement, and certificate chain.
 func (m *MockEvidenceProvider) GetEvidence(pubKeyDigest [32]byte) (*CSVEvidenceExtension, error) {
-	report := make([]byte, 2048)
-	// Hygon CSV report specification:
-	// OffsetUserData = 0x040 (decimal 64). Copy the 32-byte public key digest into report[0x040:0x060].
-	copy(report[csvattest.OffsetUserData:csvattest.OffsetUserData+32], pubKeyDigest[:])
-
-	// Populate measurement if available at OffsetMeasure (0x090, decimal 144).
-	measureBytes, err := hex.DecodeString(m.MeasurementHex)
-	if err == nil && len(measureBytes) == 32 {
-		copy(report[csvattest.OffsetMeasure:csvattest.OffsetMeasure+32], measureBytes)
+	report, hrkCert, hskCekCert, err := csvattest.GenerateMockAttestationData(pubKeyDigest[:], m.MeasurementHex)
+	if err != nil {
+		return nil, fmt.Errorf("generate mock attestation data: %w", err)
 	}
 
 	return &CSVEvidenceExtension{
 		Version:    1,
 		Report:     report,
-		HRKCert:    m.HRKCert,
-		HSKCekCert: m.HSKCekCert,
+		HRKCert:    hrkCert,
+		HSKCekCert: hskCekCert,
 	}, nil
 }
 
@@ -93,6 +87,9 @@ func (h *HygonHardwareProvider) GetEvidence(pubKeyDigest [32]byte) (*CSVEvidence
 
 	reportBuf := make([]byte, csvattest.ReportSize)
 	nonce := make([]byte, csvattest.NonceSize)
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("generate hardware attestation nonce: %w", err)
+	}
 	if err := client.GetAttestationReportIOCTL(reportBuf, nonce); err != nil {
 		return nil, fmt.Errorf("fetch attestation report from hardware: %w", err)
 	}

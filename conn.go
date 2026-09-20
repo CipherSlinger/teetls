@@ -31,6 +31,8 @@ type Conn struct {
 	readBuf []byte
 	readMu  sync.Mutex
 	writeMu sync.Mutex
+
+	closeOnce sync.Once
 }
 
 // NewClientConn wraps an existing net.Conn as a client TEE-TLS connection.
@@ -136,7 +138,12 @@ func (c *Conn) Read(b []byte) (int, error) {
 		}
 
 		if recType == RecordTypeAlert {
-			// Alert record received; treat as EOF or error
+			if len(plaintext) >= 2 && plaintext[1] == 0 {
+				return 0, io.EOF
+			}
+			if len(plaintext) >= 2 {
+				return 0, fmt.Errorf("teetls: received fatal alert (level %d, desc %d)", plaintext[0], plaintext[1])
+			}
 			return 0, io.EOF
 		}
 
@@ -192,9 +199,24 @@ func (c *Conn) Write(b []byte) (int, error) {
 	return totalSent, nil
 }
 
-// Close closes the underlying raw connection.
+// Close closes the underlying raw connection, transmitting a close_notify alert if handshake succeeded.
 func (c *Conn) Close() error {
-	return c.rawConn.Close()
+	var closeErr error
+	c.closeOnce.Do(func() {
+		if c.handshakeDone.Load() && c.outCipher != nil {
+			c.writeMu.Lock()
+			// Alert record payload: Level (1 = warning), Description (0 = close_notify)
+			alertPayload := []byte{1, 0}
+			record, err := c.outCipher.Seal(RecordTypeAlert, alertPayload)
+			if err == nil {
+				_ = c.rawConn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+				_, _ = c.rawConn.Write(record)
+			}
+			c.writeMu.Unlock()
+		}
+		closeErr = c.rawConn.Close()
+	})
+	return closeErr
 }
 
 // LocalAddr returns the local network address.

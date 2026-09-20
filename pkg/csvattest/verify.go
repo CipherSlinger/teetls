@@ -96,21 +96,23 @@ func (c *Client) VerifyAttestationReport(reportBuf []byte, verifyChain bool) err
 func VerifyReport(reportFile string, verifyChain bool) (*VerificationResult, error) {
 	reportFile = strings.TrimSpace(reportFile)
 	if reportFile == "" {
-		return nil, errors.New("报告文件不能为空")
+		return nil, errors.New("report file path cannot be empty")
 	}
 	data, err := os.ReadFile(reportFile)
 	if err != nil {
-		return nil, fmt.Errorf("读取报告文件失败: %w", err)
+		return nil, fmt.Errorf("read report file: %w", err)
 	}
 	return VerifyReportData(data, filepath.Dir(reportFile), verifyChain)
 }
 
 // VerifyOptions controls attestation verification options including explicit cert paths.
 type VerifyOptions struct {
-	VerifyChain    bool
-	HRKCertPath    string
-	HSKCekCertPath string
-	CertDir        string
+	VerifyChain     bool
+	HRKCertPath     string
+	HSKCekCertPath  string
+	CertDir         string
+	HRKCertBytes    []byte
+	HSKCekCertBytes []byte
 }
 
 // ParseReport parses an attestation report buffer into a VerificationResult.
@@ -203,7 +205,7 @@ func VerifyReportPEKSignature(res *VerificationResult) error {
 	}
 
 	if !sm2.Sm2Verify(pekPub.Key, signed, pekPub.UserID, r, s) {
-		return errors.New("报告签名验证失败")
+		return errors.New("PEK report signature verification failed")
 	}
 	res.ReportVerified = true
 	return nil
@@ -227,7 +229,13 @@ func VerifyReportWithOptions(data []byte, opts VerifyOptions) (*VerificationResu
 	}
 
 	var certs *CertChainInput
-	if opts.HRKCertPath != "" && opts.HSKCekCertPath != "" {
+	if len(opts.HRKCertBytes) > 0 && len(opts.HSKCekCertBytes) > 0 {
+		certs = &CertChainInput{
+			HRK:    opts.HRKCertBytes,
+			HSKCEK: opts.HSKCekCertBytes,
+			Source: "in-memory bytes",
+		}
+	} else if opts.HRKCertPath != "" && opts.HSKCekCertPath != "" {
 		certs, err = LoadCertChainFromFiles(opts.HRKCertPath, opts.HSKCekCertPath)
 		if err != nil {
 			return res, fmt.Errorf("load certs from files: %w", err)
@@ -287,18 +295,18 @@ func LoadCertChain(certDir string, chipIDASCII string) (*CertChainInput, error) 
 	hrk, hrkErr := DownloadCertFunc(hrkURL, HrkCertSize)
 	hskCek, hskCekErr := DownloadCertFunc(hskCekURL, HskCekSize)
 	if hrkErr == nil && hskCekErr == nil {
-		return &CertChainInput{HRK: hrk, HSKCEK: hskCek, Source: "远程下载", HRKURL: hrkURL, HSKCEKURL: hskCekURL}, nil
+		return &CertChainInput{HRK: hrk, HSKCEK: hskCek, Source: "remote download", HRKURL: hrkURL, HSKCEKURL: hskCekURL}, nil
 	}
 
 	local, localErr := LoadLocalCertChain(certDir)
 	if localErr == nil {
-		local.Source = "本地文件（远程下载失败后回退）"
-		local.DownloadNote = fmt.Sprintf("远程下载失败: HRK=%v; HSK/CEK=%v", hrkErr, hskCekErr)
+		local.Source = "local file (fallback after remote download failed)"
+		local.DownloadNote = fmt.Sprintf("remote download failed: HRK=%v; HSK/CEK=%v", hrkErr, hskCekErr)
 		local.HRKURL = hrkURL
 		local.HSKCEKURL = hskCekURL
 		return local, nil
 	}
-	return nil, fmt.Errorf("下载证书失败且本地证书不可用(chip_id=%s): HRK 下载=%v; HSK/CEK 下载=%v; 本地=%v", chipIDASCII, hrkErr, hskCekErr, localErr)
+	return nil, fmt.Errorf("failed to download certificates and local certificates unavailable (chip_id=%s): HRK download=%v; HSK/CEK download=%v; local=%v", chipIDASCII, hrkErr, hskCekErr, localErr)
 }
 
 // LoadLocalCertChain loads certificates from a directory containing hrk.cert and hsk_cek.cert.
@@ -346,68 +354,68 @@ func VerifyCertChain(certs *CertChainInput, pekCert []byte) (*CertChainDetails, 
 	var err error
 	details.HRK, err = ParseRootCertDetails(hrk)
 	if err != nil {
-		return details, fmt.Errorf("解析 HRK 证书失败: %w", err)
+		return details, fmt.Errorf("parse HRK cert: %w", err)
 	}
 	details.HSK, err = ParseRootCertDetails(hsk)
 	if err != nil {
-		return details, fmt.Errorf("解析 HSK 证书失败: %w", err)
+		return details, fmt.Errorf("parse HSK cert: %w", err)
 	}
 	details.CEK, err = ParseCSVCertDetails(cek)
 	if err != nil {
-		return details, fmt.Errorf("解析 CEK 证书失败: %w", err)
+		return details, fmt.Errorf("parse CEK cert: %w", err)
 	}
 	details.PEK, err = ParseCSVCertDetails(pekCert)
 	if err != nil {
-		return details, fmt.Errorf("解析 PEK 证书失败: %w", err)
+		return details, fmt.Errorf("parse PEK cert: %w", err)
 	}
 
 	if details.HRK.KeyUsage != KeyUsageHRK {
-		return details, fmt.Errorf("HRK key_usage 无效: 0x%x", details.HRK.KeyUsage)
+		return details, fmt.Errorf("invalid HRK key_usage: 0x%x", details.HRK.KeyUsage)
 	}
 	if details.HSK.KeyUsage != KeyUsageHSK {
-		return details, fmt.Errorf("HSK key_usage 无效: 0x%x", details.HSK.KeyUsage)
+		return details, fmt.Errorf("invalid HSK key_usage: 0x%x", details.HSK.KeyUsage)
 	}
 	if details.CEK.PubKeyUsage != KeyUsageCEK {
-		return details, fmt.Errorf("CEK pubkey_usage 无效: 0x%x", details.CEK.PubKeyUsage)
+		return details, fmt.Errorf("invalid CEK pubkey_usage: 0x%x", details.CEK.PubKeyUsage)
 	}
 	if details.CEK.Sig1Usage != KeyUsageHSK {
-		return details, fmt.Errorf("CEK sig1_usage 无效: 0x%x", details.CEK.Sig1Usage)
+		return details, fmt.Errorf("invalid CEK sig1_usage: 0x%x", details.CEK.Sig1Usage)
 	}
 	if details.CEK.Sig2Usage != KeyUsageInvalid {
-		return details, fmt.Errorf("CEK sig2_usage 无效: 0x%x", details.CEK.Sig2Usage)
+		return details, fmt.Errorf("invalid CEK sig2_usage: 0x%x", details.CEK.Sig2Usage)
 	}
 	if details.PEK.PubKeyUsage != KeyUsagePEK {
-		return details, fmt.Errorf("PEK pubkey_usage 无效: 0x%x", details.PEK.PubKeyUsage)
+		return details, fmt.Errorf("invalid PEK pubkey_usage: 0x%x", details.PEK.PubKeyUsage)
 	}
 
 	hrkPub, err := parseHygonPubKey(hrk[OffsetRootPubKey:])
 	if err != nil {
-		return details, fmt.Errorf("解析 HRK 公钥失败: %w", err)
+		return details, fmt.Errorf("parse HRK public key: %w", err)
 	}
 	hskPub, err := parseHygonPubKey(hsk[OffsetRootPubKey:])
 	if err != nil {
-		return details, fmt.Errorf("解析 HSK 公钥失败: %w", err)
+		return details, fmt.Errorf("parse HSK public key: %w", err)
 	}
 	cekPub, err := parseHygonPubKey(cek[OffsetCSVPubKey:])
 	if err != nil {
-		return details, fmt.Errorf("解析 CEK 公钥失败: %w", err)
+		return details, fmt.Errorf("parse CEK public key: %w", err)
 	}
 
 	details.HRK.SelfSignatureVerified = verifyHygonSignature(hrkPub, hrk[:OffsetRootSig], hrk[OffsetRootSig:])
 	if !details.HRK.SelfSignatureVerified {
-		return details, errors.New("HRK 自签名验证失败")
+		return details, errors.New("HRK self-signature verification failed")
 	}
 	details.HSK.SignedByHRKVerified = verifyHygonSignature(hrkPub, hsk[:OffsetRootSig], hsk[OffsetRootSig:])
 	if !details.HSK.SignedByHRKVerified {
-		return details, errors.New("HRK 验证 HSK 签名失败")
+		return details, errors.New("HRK verification of HSK signature failed")
 	}
 	details.CEK.SignedByHSKVerified = verifyHygonSignature(hskPub, cek[:OffsetCSVSig1Usage], cek[OffsetCSVSig1:])
 	if !details.CEK.SignedByHSKVerified {
-		return details, errors.New("HSK 验证 CEK 签名失败")
+		return details, errors.New("HSK verification of CEK signature failed")
 	}
 	details.PEK.SignedByCEKVerified = verifyHygonSignature(cekPub, pekCert[:OffsetCSVSig1Usage], pekCert[OffsetCSVSig1:])
 	if !details.PEK.SignedByCEKVerified {
-		return details, errors.New("CEK 验证 PEK 签名失败")
+		return details, errors.New("CEK verification of PEK signature failed")
 	}
 	return details, nil
 }
@@ -420,11 +428,11 @@ type hygonPubKey struct {
 
 func parseHygonPubKey(data []byte) (*hygonPubKey, error) {
 	if len(data) < OffsetECCPubKeyUserID+256 {
-		return nil, errors.New("公钥数据长度不足")
+		return nil, errors.New("public key data too short")
 	}
 	curveID := binary.LittleEndian.Uint32(data)
 	if curveID != CurveIDSM2 {
-		return nil, fmt.Errorf("不支持的曲线 ID: 0x%x", curveID)
+		return nil, fmt.Errorf("unsupported curve ID: 0x%x", curveID)
 	}
 	xBytes := ReverseCopy(data[OffsetECCPubKeyQX : OffsetECCPubKeyQX+32])
 	yBytes := ReverseCopy(data[OffsetECCPubKeyQY : OffsetECCPubKeyQY+32])
@@ -433,7 +441,7 @@ func parseHygonPubKey(data []byte) (*hygonPubKey, error) {
 	uidData := data[OffsetECCPubKeyUserID:]
 	uidLen := int(binary.LittleEndian.Uint16(uidData))
 	if uidLen > len(uidData)-2 {
-		return nil, fmt.Errorf("SM2 user id 长度无效: %d", uidLen)
+		return nil, fmt.Errorf("invalid SM2 user id length: %d", uidLen)
 	}
 	userID := append([]byte(nil), uidData[2:2+uidLen]...)
 	return &hygonPubKey{

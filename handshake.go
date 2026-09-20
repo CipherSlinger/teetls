@@ -37,14 +37,25 @@ const (
 	RandomBytesLen = 32
 )
 
-// HandshakeKeys holds the symmetric keys and IVs derived via HKDF-SM3.
-type HandshakeKeys struct {
+// HandshakeTrafficKeys holds the symmetric keys and IVs derived via HKDF-SM3 for the handshake phase.
+type HandshakeTrafficKeys struct {
 	ClientWriteKey    []byte // 16 bytes
 	ClientWriteIV     []byte // 12 bytes
 	ServerWriteKey    []byte // 16 bytes
 	ServerWriteIV     []byte // 12 bytes
 	ServerFinishedKey []byte // 32 bytes
 	ClientFinishedKey []byte // 32 bytes
+}
+
+// HandshakeKeys is maintained as an alias to HandshakeTrafficKeys for compatibility.
+type HandshakeKeys = HandshakeTrafficKeys
+
+// ApplicationTrafficKeys holds distinct symmetric keys and IVs for application data traffic.
+type ApplicationTrafficKeys struct {
+	ClientWriteKey []byte // 16 bytes
+	ClientWriteIV  []byte // 12 bytes
+	ServerWriteKey []byte // 16 bytes
+	ServerWriteIV  []byte // 12 bytes
 }
 
 // HandshakeResult holds peer attestation and certificate after a successful handshake.
@@ -68,7 +79,58 @@ func encodeHandshakeMsg(msgType uint8, body []byte) []byte {
 	return append(header, body...)
 }
 
-// readHandshakeMsg reads exactly one handshake message from an io.Reader.
+// writePlaintextHandshakeMsg encapsulates a handshake message into a 5-byte TLSPlaintext record and writes it to w.
+func writePlaintextHandshakeMsg(w io.Writer, msgType uint8, body []byte) ([]byte, error) {
+	hsMsg := encodeHandshakeMsg(msgType, body)
+	if len(hsMsg) > MaxPlaintextLength {
+		return nil, errors.New("teetls: plaintext handshake message exceeds max record length")
+	}
+
+	record := make([]byte, RecordHeaderLen+len(hsMsg))
+	record[0] = byte(RecordTypeHandshake)
+	record[1] = 0x03
+	record[2] = 0x03
+	binary.BigEndian.PutUint16(record[3:5], uint16(len(hsMsg)))
+	copy(record[RecordHeaderLen:], hsMsg)
+
+	if _, err := w.Write(record); err != nil {
+		return nil, fmt.Errorf("write plaintext handshake record: %w", err)
+	}
+	return hsMsg, nil
+}
+
+// readPlaintextHandshakeMsg reads a TLSPlaintext record from r and decodes the handshake message.
+func readPlaintextHandshakeMsg(r io.Reader) (uint8, []byte, []byte, error) {
+	header := make([]byte, RecordHeaderLen)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return 0, nil, nil, fmt.Errorf("read plaintext record header: %w", err)
+	}
+
+	if header[0] != byte(RecordTypeHandshake) {
+		return 0, nil, nil, fmt.Errorf("teetls: expected plaintext handshake record (22), got %d", header[0])
+	}
+
+	payloadLen := int(binary.BigEndian.Uint16(header[3:5]))
+	if payloadLen < HandshakeHeaderLen || payloadLen > MaxPlaintextLength {
+		return 0, nil, nil, fmt.Errorf("teetls: invalid plaintext handshake record payload length %d", payloadLen)
+	}
+
+	hsMsg := make([]byte, payloadLen)
+	if _, err := io.ReadFull(r, hsMsg); err != nil {
+		return 0, nil, nil, fmt.Errorf("read plaintext handshake payload: %w", err)
+	}
+
+	msgType := hsMsg[0]
+	msgLen := int(hsMsg[1])<<16 | int(hsMsg[2])<<8 | int(hsMsg[3])
+	if msgLen != payloadLen-HandshakeHeaderLen {
+		return 0, nil, nil, fmt.Errorf("teetls: handshake message length mismatch: declared %d, record body %d", msgLen, payloadLen-HandshakeHeaderLen)
+	}
+
+	body := hsMsg[HandshakeHeaderLen:]
+	return msgType, body, hsMsg, nil
+}
+
+// readHandshakeMsg reads exactly one handshake message from an io.Reader without TLS record framing.
 func readHandshakeMsg(r io.Reader) (uint8, []byte, error) {
 	header := make([]byte, HandshakeHeaderLen)
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -144,13 +206,13 @@ func extractSM2PublicKey(pubKey interface{}) (*sm2.PublicKey, error) {
 	}
 }
 
-// deriveKeys computes the RFC 8998 ShangMi TLS 1.3 symmetric keys using HKDF-SM3.
-func deriveKeys(sharedSecret, clientRandom, serverRandom []byte) (*HandshakeKeys, error) {
+// deriveHandshakeTrafficKeys computes the RFC 8998 ShangMi TLS 1.3 handshake traffic keys using HKDF-SM3.
+func deriveHandshakeTrafficKeys(sharedSecret, clientRandom, serverRandom []byte) (*HandshakeTrafficKeys, error) {
 	salt := append(append([]byte{}, clientRandom...), serverRandom...)
-	info := []byte("tls13-rfc8998-sm4-gcm-sm3")
+	info := []byte("tls13-rfc8998-sm4-gcm-sm3-handshake")
 	kdf := hkdf.New(sm3.New, sharedSecret, salt, info)
 
-	keys := &HandshakeKeys{
+	keys := &HandshakeTrafficKeys{
 		ClientWriteKey:    make([]byte, 16),
 		ClientWriteIV:     make([]byte, 12),
 		ServerWriteKey:    make([]byte, 16),
@@ -160,16 +222,16 @@ func deriveKeys(sharedSecret, clientRandom, serverRandom []byte) (*HandshakeKeys
 	}
 
 	if _, err := io.ReadFull(kdf, keys.ClientWriteKey); err != nil {
-		return nil, fmt.Errorf("derive client write key: %w", err)
+		return nil, fmt.Errorf("derive client handshake write key: %w", err)
 	}
 	if _, err := io.ReadFull(kdf, keys.ClientWriteIV); err != nil {
-		return nil, fmt.Errorf("derive client write iv: %w", err)
+		return nil, fmt.Errorf("derive client handshake write iv: %w", err)
 	}
 	if _, err := io.ReadFull(kdf, keys.ServerWriteKey); err != nil {
-		return nil, fmt.Errorf("derive server write key: %w", err)
+		return nil, fmt.Errorf("derive server handshake write key: %w", err)
 	}
 	if _, err := io.ReadFull(kdf, keys.ServerWriteIV); err != nil {
-		return nil, fmt.Errorf("derive server write iv: %w", err)
+		return nil, fmt.Errorf("derive server handshake write iv: %w", err)
 	}
 	if _, err := io.ReadFull(kdf, keys.ServerFinishedKey); err != nil {
 		return nil, fmt.Errorf("derive server finished key: %w", err)
@@ -181,6 +243,39 @@ func deriveKeys(sharedSecret, clientRandom, serverRandom []byte) (*HandshakeKeys
 	return keys, nil
 }
 
+// deriveApplicationTrafficKeys computes distinct symmetric keys for application data traffic.
+func deriveApplicationTrafficKeys(sharedSecret, transcriptHash []byte) (*ApplicationTrafficKeys, error) {
+	info := []byte("tls13-rfc8998-sm4-gcm-sm3-application")
+	kdf := hkdf.New(sm3.New, sharedSecret, transcriptHash, info)
+
+	keys := &ApplicationTrafficKeys{
+		ClientWriteKey: make([]byte, 16),
+		ClientWriteIV:  make([]byte, 12),
+		ServerWriteKey: make([]byte, 16),
+		ServerWriteIV:  make([]byte, 12),
+	}
+
+	if _, err := io.ReadFull(kdf, keys.ClientWriteKey); err != nil {
+		return nil, fmt.Errorf("derive client app write key: %w", err)
+	}
+	if _, err := io.ReadFull(kdf, keys.ClientWriteIV); err != nil {
+		return nil, fmt.Errorf("derive client app write iv: %w", err)
+	}
+	if _, err := io.ReadFull(kdf, keys.ServerWriteKey); err != nil {
+		return nil, fmt.Errorf("derive server app write key: %w", err)
+	}
+	if _, err := io.ReadFull(kdf, keys.ServerWriteIV); err != nil {
+		return nil, fmt.Errorf("derive server app write iv: %w", err)
+	}
+
+	return keys, nil
+}
+
+// deriveKeys is kept for backward compatibility, returning handshake keys.
+func deriveKeys(sharedSecret, clientRandom, serverRandom []byte) (*HandshakeTrafficKeys, error) {
+	return deriveHandshakeTrafficKeys(sharedSecret, clientRandom, serverRandom)
+}
+
 // computeHMACSM3 calculates HMAC-SM3 over the input data using the given key.
 func computeHMACSM3(key, data []byte) []byte {
 	mac := hmac.New(sm3.New, key)
@@ -190,50 +285,26 @@ func computeHMACSM3(key, data []byte) []byte {
 
 // prepareServerCertificate resolves or generates server SM2 certificate and private key.
 func prepareServerCertificate(cfg *Config) (certPEM []byte, privKey *sm2.PrivateKey, err error) {
-	if len(cfg.CertPEM) > 0 && len(cfg.KeyPEM) > 0 {
-		priv, err := gx509.ReadPrivateKeyFromPem(cfg.KeyPEM, nil)
-		if err != nil {
-			return nil, nil, fmt.Errorf("read server private key: %w", err)
-		}
-		return cfg.CertPEM, priv, nil
-	}
-
-	if cfg.EvidenceProvider == nil {
-		return nil, nil, errors.New("teetls: server requires either CertPEM/KeyPEM or EvidenceProvider")
-	}
-
-	certPEM, keyPEM, err := GenerateSM2CertificateWithEvidence(cfg.EvidenceProvider)
+	certPEM, keyPEM, err := cfg.GetOrGenerateCertificate()
 	if err != nil {
-		return nil, nil, fmt.Errorf("generate server certificate: %w", err)
+		return nil, nil, fmt.Errorf("prepare server certificate: %w", err)
 	}
 	priv, err := gx509.ReadPrivateKeyFromPem(keyPEM, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read generated server private key: %w", err)
+		return nil, nil, fmt.Errorf("read server private key: %w", err)
 	}
 	return certPEM, priv, nil
 }
 
 // prepareClientCertificate resolves or generates client SM2 certificate and private key for mutual attestation.
 func prepareClientCertificate(cfg *Config) (certPEM []byte, privKey *sm2.PrivateKey, err error) {
-	if len(cfg.CertPEM) > 0 && len(cfg.KeyPEM) > 0 {
-		priv, err := gx509.ReadPrivateKeyFromPem(cfg.KeyPEM, nil)
-		if err != nil {
-			return nil, nil, fmt.Errorf("read client private key: %w", err)
-		}
-		return cfg.CertPEM, priv, nil
-	}
-
-	if cfg.EvidenceProvider == nil {
-		return nil, nil, errors.New("teetls: mutual attestation enabled on client but no EvidenceProvider provided")
-	}
-
-	certPEM, keyPEM, err := GenerateSM2CertificateWithEvidence(cfg.EvidenceProvider)
+	certPEM, keyPEM, err := cfg.GetOrGenerateCertificate()
 	if err != nil {
-		return nil, nil, fmt.Errorf("generate client certificate: %w", err)
+		return nil, nil, fmt.Errorf("prepare client certificate: %w", err)
 	}
 	priv, err := gx509.ReadPrivateKeyFromPem(keyPEM, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read generated client private key: %w", err)
+		return nil, nil, fmt.Errorf("read client private key: %w", err)
 	}
 	return certPEM, priv, nil
 }
@@ -269,19 +340,18 @@ func ClientHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 		clientHelloBody[RandomBytesLen+SM2UncompressedPubKeyLen] = 0
 	}
 
-	clientHelloWire := encodeHandshakeMsg(HandshakeTypeClientHello, clientHelloBody)
-
-	// Initialize transcript hash accumulator
-	transcript := bytes.NewBuffer(nil)
-	transcript.Write(clientHelloWire)
-
-	// Send ClientHello
-	if _, err := rawConn.Write(clientHelloWire); err != nil {
+	// Send ClientHello wrapped in TLSPlaintext record
+	clientHelloWire, err := writePlaintextHandshakeMsg(rawConn, HandshakeTypeClientHello, clientHelloBody)
+	if err != nil {
 		return nil, fmt.Errorf("teetls: send ClientHello: %w", err)
 	}
 
-	// 2. Read ServerHello
-	msgType, serverHelloBody, err := readHandshakeMsg(rawConn)
+	// Initialize transcript hash accumulator with ClientHello handshake message
+	transcript := bytes.NewBuffer(nil)
+	transcript.Write(clientHelloWire)
+
+	// 2. Read ServerHello wrapped in TLSPlaintext record
+	msgType, serverHelloBody, serverHelloWire, err := readPlaintextHandshakeMsg(rawConn)
 	if err != nil {
 		return nil, fmt.Errorf("teetls: read ServerHello: %w", err)
 	}
@@ -299,33 +369,31 @@ func ClientHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 		return nil, fmt.Errorf("teetls: decode server ephemeral public key: %w", err)
 	}
 
-	transcript.Write(encodeHandshakeMsg(HandshakeTypeServerHello, serverHelloBody))
+	transcript.Write(serverHelloWire)
 
-	// 3. Compute ECDHE shared secret & derive handshake keys
+	// 3. Compute ECDHE shared secret & derive handshake traffic keys
 	sharedSecret, err := computeECDHESharedSecret(serverEphemeralPub, clientEphemeralPriv)
 	if err != nil {
 		return nil, fmt.Errorf("teetls: compute shared secret: %w", err)
 	}
 
-	keys, err := deriveKeys(sharedSecret, clientRandom[:], serverRandom)
+	handshakeKeys, err := deriveHandshakeTrafficKeys(sharedSecret, clientRandom[:], serverRandom)
 	if err != nil {
-		return nil, fmt.Errorf("teetls: derive keys: %w", err)
+		return nil, fmt.Errorf("teetls: derive handshake traffic keys: %w", err)
 	}
 
 	// Create handshake record ciphers
-	// Server to client cipher
-	serverCipher, err := NewRecordCipher(keys.ServerWriteKey, keys.ServerWriteIV)
+	serverHandshakeCipher, err := NewRecordCipher(handshakeKeys.ServerWriteKey, handshakeKeys.ServerWriteIV)
 	if err != nil {
-		return nil, fmt.Errorf("teetls: server record cipher: %w", err)
+		return nil, fmt.Errorf("teetls: server handshake record cipher: %w", err)
 	}
-	// Client to server cipher
-	clientCipher, err := NewRecordCipher(keys.ClientWriteKey, keys.ClientWriteIV)
+	clientHandshakeCipher, err := NewRecordCipher(handshakeKeys.ClientWriteKey, handshakeKeys.ClientWriteIV)
 	if err != nil {
-		return nil, fmt.Errorf("teetls: client record cipher: %w", err)
+		return nil, fmt.Errorf("teetls: client handshake record cipher: %w", err)
 	}
 
 	// 4. Read EncryptedExtensions (encrypted)
-	msgType, encExtensionsBody, err := readEncryptedHandshakeMsg(rawConn, serverCipher)
+	msgType, encExtensionsBody, err := readEncryptedHandshakeMsg(rawConn, serverHandshakeCipher)
 	if err != nil {
 		return nil, fmt.Errorf("teetls: read EncryptedExtensions: %w", err)
 	}
@@ -335,7 +403,7 @@ func ClientHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 	transcript.Write(encodeHandshakeMsg(HandshakeTypeEncryptedExtensions, encExtensionsBody))
 
 	// 5. Read Certificate (encrypted)
-	msgType, certBody, err := readEncryptedHandshakeMsg(rawConn, serverCipher)
+	msgType, certBody, err := readEncryptedHandshakeMsg(rawConn, serverHandshakeCipher)
 	if err != nil {
 		return nil, fmt.Errorf("teetls: read server Certificate: %w", err)
 	}
@@ -365,7 +433,7 @@ func ClientHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 	copy(transcriptForVerify, transcript.Bytes())
 
 	// 6. Read CertificateVerify (encrypted)
-	msgType, sigBody, err := readEncryptedHandshakeMsg(rawConn, serverCipher)
+	msgType, sigBody, err := readEncryptedHandshakeMsg(rawConn, serverHandshakeCipher)
 	if err != nil {
 		return nil, fmt.Errorf("teetls: read CertificateVerify: %w", err)
 	}
@@ -373,9 +441,8 @@ func ClientHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 		return nil, fmt.Errorf("teetls: expected CertificateVerify (15), got %d", msgType)
 	}
 
-	// Verify server signature over transcript hash
-	transcriptSM3 := sm3.Sm3Sum(transcriptForVerify)
-	if !serverPub.Verify(transcriptSM3, sigBody) {
+	// Verify server signature directly over transcript (sm2.Verify handles SM3 hashing internally)
+	if !serverPub.Verify(transcriptForVerify, sigBody) {
 		return nil, errors.New("teetls: server CertificateVerify signature verification failed")
 	}
 	transcript.Write(encodeHandshakeMsg(HandshakeTypeCertificateVerify, sigBody))
@@ -385,7 +452,7 @@ func ClientHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 	copy(transcriptForServerFinished, transcript.Bytes())
 
 	// 7. Read Server Finished (encrypted)
-	msgType, finishedBody, err := readEncryptedHandshakeMsg(rawConn, serverCipher)
+	msgType, finishedBody, err := readEncryptedHandshakeMsg(rawConn, serverHandshakeCipher)
 	if err != nil {
 		return nil, fmt.Errorf("teetls: read Server Finished: %w", err)
 	}
@@ -393,7 +460,7 @@ func ClientHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 		return nil, fmt.Errorf("teetls: expected Finished (20), got %d", msgType)
 	}
 
-	expectedServerTag := computeHMACSM3(keys.ServerFinishedKey, transcriptForServerFinished)
+	expectedServerTag := computeHMACSM3(handshakeKeys.ServerFinishedKey, transcriptForServerFinished)
 	if !hmac.Equal(finishedBody, expectedServerTag) {
 		return nil, errors.New("teetls: server finished HMAC verification failed")
 	}
@@ -407,37 +474,50 @@ func ClientHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 		}
 
 		// Send client Certificate
-		if err := writeEncryptedHandshakeMsg(rawConn, clientCipher, HandshakeTypeCertificate, clientCertPEM); err != nil {
+		if err := writeEncryptedHandshakeMsg(rawConn, clientHandshakeCipher, HandshakeTypeCertificate, clientCertPEM); err != nil {
 			return nil, fmt.Errorf("teetls: send client Certificate: %w", err)
 		}
 		transcript.Write(encodeHandshakeMsg(HandshakeTypeCertificate, clientCertPEM))
 
-		// Sign transcript before CertificateVerify
-		clientTranscriptSM3 := sm3.Sm3Sum(transcript.Bytes())
-		clientSig, err := clientPriv.Sign(rand.Reader, clientTranscriptSM3, nil)
+		// Sign transcript before CertificateVerify (sm2.Sign handles SM3 hashing internally)
+		clientSig, err := clientPriv.Sign(rand.Reader, transcript.Bytes(), nil)
 		if err != nil {
 			return nil, fmt.Errorf("teetls: sign client transcript: %w", err)
 		}
 
-		if err := writeEncryptedHandshakeMsg(rawConn, clientCipher, HandshakeTypeCertificateVerify, clientSig); err != nil {
+		if err := writeEncryptedHandshakeMsg(rawConn, clientHandshakeCipher, HandshakeTypeCertificateVerify, clientSig); err != nil {
 			return nil, fmt.Errorf("teetls: send client CertificateVerify: %w", err)
 		}
 		transcript.Write(encodeHandshakeMsg(HandshakeTypeCertificateVerify, clientSig))
 	}
 
 	// 9. Send Client Finished (encrypted)
-	clientFinishedTag := computeHMACSM3(keys.ClientFinishedKey, transcript.Bytes())
-	if err := writeEncryptedHandshakeMsg(rawConn, clientCipher, HandshakeTypeFinished, clientFinishedTag); err != nil {
+	clientFinishedTag := computeHMACSM3(handshakeKeys.ClientFinishedKey, transcript.Bytes())
+	if err := writeEncryptedHandshakeMsg(rawConn, clientHandshakeCipher, HandshakeTypeFinished, clientFinishedTag); err != nil {
 		return nil, fmt.Errorf("teetls: send Client Finished: %w", err)
 	}
+	transcript.Write(encodeHandshakeMsg(HandshakeTypeFinished, clientFinishedTag))
 
-	// Handshake complete! Reset sequence numbers on ciphers for application data traffic.
-	clientCipher.Reset()
-	serverCipher.Reset()
+	// 10. Handshake complete! Derive application traffic keys bound to the full transcript hash.
+	finalTranscriptHash := sm3.Sm3Sum(transcript.Bytes())
+	appKeys, err := deriveApplicationTrafficKeys(sharedSecret, finalTranscriptHash[:])
+	if err != nil {
+		return nil, fmt.Errorf("teetls: derive application traffic keys: %w", err)
+	}
+
+	// Instantiate fresh application record ciphers (starting at sequence number 0)
+	appServerCipher, err := NewRecordCipher(appKeys.ServerWriteKey, appKeys.ServerWriteIV)
+	if err != nil {
+		return nil, fmt.Errorf("teetls: create server application cipher: %w", err)
+	}
+	appClientCipher, err := NewRecordCipher(appKeys.ClientWriteKey, appKeys.ClientWriteIV)
+	if err != nil {
+		return nil, fmt.Errorf("teetls: create client application cipher: %w", err)
+	}
 
 	return &HandshakeResult{
-		InCipher:        serverCipher, // client reads from server
-		OutCipher:       clientCipher, // client writes to server
+		InCipher:        appServerCipher, // client reads from server
+		OutCipher:       appClientCipher, // client writes to server
 		PeerCertPEM:     serverCertPEM,
 		PeerEvidence:    evidence,
 		PeerCertificate: serverGCert,
@@ -459,8 +539,8 @@ func ServerHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 		return nil, fmt.Errorf("teetls: prepare server certificate: %w", err)
 	}
 
-	// 1. Read ClientHello
-	msgType, clientHelloBody, err := readHandshakeMsg(rawConn)
+	// 1. Read ClientHello wrapped in TLSPlaintext record
+	msgType, clientHelloBody, clientHelloWire, err := readPlaintextHandshakeMsg(rawConn)
 	if err != nil {
 		return nil, fmt.Errorf("teetls: read ClientHello: %w", err)
 	}
@@ -484,7 +564,7 @@ func ServerHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 	}
 
 	transcript := bytes.NewBuffer(nil)
-	transcript.Write(encodeHandshakeMsg(HandshakeTypeClientHello, clientHelloBody))
+	transcript.Write(clientHelloWire)
 
 	// 2. Generate server ephemeral SM2 key pair and random bytes
 	serverEphemeralPriv, err := sm2.GenerateKey(rand.Reader)
@@ -503,32 +583,31 @@ func ServerHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 	copy(serverHelloBody[:RandomBytesLen], serverRandom[:])
 	copy(serverHelloBody[RandomBytesLen:], serverEphemeralPubBytes)
 
-	serverHelloWire := encodeHandshakeMsg(HandshakeTypeServerHello, serverHelloBody)
-	transcript.Write(serverHelloWire)
-
-	// Send ServerHello
-	if _, err := rawConn.Write(serverHelloWire); err != nil {
+	// Send ServerHello wrapped in TLSPlaintext record
+	serverHelloWire, err := writePlaintextHandshakeMsg(rawConn, HandshakeTypeServerHello, serverHelloBody)
+	if err != nil {
 		return nil, fmt.Errorf("teetls: send ServerHello: %w", err)
 	}
+	transcript.Write(serverHelloWire)
 
-	// 3. Compute ECDHE shared secret & derive keys
+	// 3. Compute ECDHE shared secret & derive handshake traffic keys
 	sharedSecret, err := computeECDHESharedSecret(clientEphemeralPub, serverEphemeralPriv)
 	if err != nil {
 		return nil, fmt.Errorf("teetls: compute shared secret: %w", err)
 	}
 
-	keys, err := deriveKeys(sharedSecret, clientRandom, serverRandom[:])
+	handshakeKeys, err := deriveHandshakeTrafficKeys(sharedSecret, clientRandom, serverRandom[:])
 	if err != nil {
-		return nil, fmt.Errorf("teetls: derive keys: %w", err)
+		return nil, fmt.Errorf("teetls: derive handshake traffic keys: %w", err)
 	}
 
-	serverCipher, err := NewRecordCipher(keys.ServerWriteKey, keys.ServerWriteIV)
+	serverHandshakeCipher, err := NewRecordCipher(handshakeKeys.ServerWriteKey, handshakeKeys.ServerWriteIV)
 	if err != nil {
-		return nil, fmt.Errorf("teetls: server record cipher: %w", err)
+		return nil, fmt.Errorf("teetls: server handshake record cipher: %w", err)
 	}
-	clientCipher, err := NewRecordCipher(keys.ClientWriteKey, keys.ClientWriteIV)
+	clientHandshakeCipher, err := NewRecordCipher(handshakeKeys.ClientWriteKey, handshakeKeys.ClientWriteIV)
 	if err != nil {
-		return nil, fmt.Errorf("teetls: client record cipher: %w", err)
+		return nil, fmt.Errorf("teetls: client handshake record cipher: %w", err)
 	}
 
 	// 4. Send EncryptedExtensions (encrypted)
@@ -538,32 +617,31 @@ func ServerHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 	} else {
 		encExtBody = []byte{0}
 	}
-	if err := writeEncryptedHandshakeMsg(rawConn, serverCipher, HandshakeTypeEncryptedExtensions, encExtBody); err != nil {
+	if err := writeEncryptedHandshakeMsg(rawConn, serverHandshakeCipher, HandshakeTypeEncryptedExtensions, encExtBody); err != nil {
 		return nil, fmt.Errorf("teetls: send EncryptedExtensions: %w", err)
 	}
 	transcript.Write(encodeHandshakeMsg(HandshakeTypeEncryptedExtensions, encExtBody))
 
 	// 5. Send server Certificate (encrypted)
-	if err := writeEncryptedHandshakeMsg(rawConn, serverCipher, HandshakeTypeCertificate, serverCertPEM); err != nil {
+	if err := writeEncryptedHandshakeMsg(rawConn, serverHandshakeCipher, HandshakeTypeCertificate, serverCertPEM); err != nil {
 		return nil, fmt.Errorf("teetls: send server Certificate: %w", err)
 	}
 	transcript.Write(encodeHandshakeMsg(HandshakeTypeCertificate, serverCertPEM))
 
 	// 6. Send CertificateVerify (encrypted)
-	// SM2 sign transcript SM3 digest using server private key
-	transcriptSM3 := sm3.Sm3Sum(transcript.Bytes())
-	serverSig, err := serverPriv.Sign(rand.Reader, transcriptSM3, nil)
+	// SM2 sign transcript directly using server private key (sm2.Sign handles SM3 hashing internally)
+	serverSig, err := serverPriv.Sign(rand.Reader, transcript.Bytes(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("teetls: sign server transcript: %w", err)
 	}
-	if err := writeEncryptedHandshakeMsg(rawConn, serverCipher, HandshakeTypeCertificateVerify, serverSig); err != nil {
+	if err := writeEncryptedHandshakeMsg(rawConn, serverHandshakeCipher, HandshakeTypeCertificateVerify, serverSig); err != nil {
 		return nil, fmt.Errorf("teetls: send server CertificateVerify: %w", err)
 	}
 	transcript.Write(encodeHandshakeMsg(HandshakeTypeCertificateVerify, serverSig))
 
 	// 7. Send Server Finished (encrypted)
-	serverFinishedTag := computeHMACSM3(keys.ServerFinishedKey, transcript.Bytes())
-	if err := writeEncryptedHandshakeMsg(rawConn, serverCipher, HandshakeTypeFinished, serverFinishedTag); err != nil {
+	serverFinishedTag := computeHMACSM3(handshakeKeys.ServerFinishedKey, transcript.Bytes())
+	if err := writeEncryptedHandshakeMsg(rawConn, serverHandshakeCipher, HandshakeTypeFinished, serverFinishedTag); err != nil {
 		return nil, fmt.Errorf("teetls: send Server Finished: %w", err)
 	}
 	transcript.Write(encodeHandshakeMsg(HandshakeTypeFinished, serverFinishedTag))
@@ -575,7 +653,7 @@ func ServerHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 	// 8. If mutual attestation is required/performed, read Client Certificate & CertificateVerify
 	if cfg.VerifyMutualAttestation || clientRequestedMutual {
 		// Read client Certificate
-		msgType, clientCertBody, err := readEncryptedHandshakeMsg(rawConn, clientCipher)
+		msgType, clientCertBody, err := readEncryptedHandshakeMsg(rawConn, clientHandshakeCipher)
 		if err != nil {
 			return nil, fmt.Errorf("teetls: read client Certificate: %w", err)
 		}
@@ -608,7 +686,7 @@ func ServerHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 		copy(clientTranscriptForVerify, transcript.Bytes())
 
 		// Read client CertificateVerify
-		msgType, clientSigBody, err := readEncryptedHandshakeMsg(rawConn, clientCipher)
+		msgType, clientSigBody, err := readEncryptedHandshakeMsg(rawConn, clientHandshakeCipher)
 		if err != nil {
 			return nil, fmt.Errorf("teetls: read client CertificateVerify: %w", err)
 		}
@@ -616,17 +694,17 @@ func ServerHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 			return nil, fmt.Errorf("teetls: expected client CertificateVerify (15), got %d", msgType)
 		}
 
-		clientTranscriptSM3 := sm3.Sm3Sum(clientTranscriptForVerify)
-		if !clientPub.Verify(clientTranscriptSM3, clientSigBody) {
+		// Verify client signature directly over transcript
+		if !clientPub.Verify(clientTranscriptForVerify, clientSigBody) {
 			return nil, errors.New("teetls: client CertificateVerify signature verification failed")
 		}
 		transcript.Write(encodeHandshakeMsg(HandshakeTypeCertificateVerify, clientSigBody))
 	}
 
 	// 9. Read Client Finished (encrypted)
-	expectedClientTag := computeHMACSM3(keys.ClientFinishedKey, transcript.Bytes())
+	expectedClientTag := computeHMACSM3(handshakeKeys.ClientFinishedKey, transcript.Bytes())
 
-	msgType, clientFinishedBody, err := readEncryptedHandshakeMsg(rawConn, clientCipher)
+	msgType, clientFinishedBody, err := readEncryptedHandshakeMsg(rawConn, clientHandshakeCipher)
 	if err != nil {
 		return nil, fmt.Errorf("teetls: read Client Finished: %w", err)
 	}
@@ -637,72 +715,104 @@ func ServerHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 	if !hmac.Equal(clientFinishedBody, expectedClientTag) {
 		return nil, errors.New("teetls: client finished HMAC verification failed")
 	}
+	transcript.Write(encodeHandshakeMsg(HandshakeTypeFinished, clientFinishedBody))
 
-	// Handshake complete! Reset sequence numbers on ciphers for application data traffic.
-	clientCipher.Reset()
-	serverCipher.Reset()
+	// 10. Handshake complete! Derive application traffic keys bound to the full transcript hash.
+	finalTranscriptHash := sm3.Sm3Sum(transcript.Bytes())
+	appKeys, err := deriveApplicationTrafficKeys(sharedSecret, finalTranscriptHash[:])
+	if err != nil {
+		return nil, fmt.Errorf("teetls: derive application traffic keys: %w", err)
+	}
+
+	// Instantiate fresh application record ciphers (starting at sequence number 0)
+	appClientCipher, err := NewRecordCipher(appKeys.ClientWriteKey, appKeys.ClientWriteIV)
+	if err != nil {
+		return nil, fmt.Errorf("teetls: create client application cipher: %w", err)
+	}
+	appServerCipher, err := NewRecordCipher(appKeys.ServerWriteKey, appKeys.ServerWriteIV)
+	if err != nil {
+		return nil, fmt.Errorf("teetls: create server application cipher: %w", err)
+	}
 
 	return &HandshakeResult{
-		InCipher:        clientCipher, // server reads from client
-		OutCipher:       serverCipher, // server writes to client
+		InCipher:        appClientCipher, // server reads from client
+		OutCipher:       appServerCipher, // server writes to client
 		PeerCertPEM:     peerCertPEM,
 		PeerEvidence:    peerEvidence,
 		PeerCertificate: peerGCert,
 	}, nil
 }
 
-// readEncryptedHandshakeMsg reads a TLS record containing an encrypted handshake message.
+// readEncryptedHandshakeMsg reads one complete handshake message, assembling across fragmented TLS records if necessary.
 func readEncryptedHandshakeMsg(r io.Reader, cipher *RecordCipher) (uint8, []byte, error) {
-	// Read 5-byte record header first to know record length
-	header := make([]byte, RecordHeaderLen)
-	if _, err := io.ReadFull(r, header); err != nil {
-		return 0, nil, fmt.Errorf("read record header: %w", err)
-	}
+	var assembled []byte
+	var msgType uint8
+	var expectedTotalLen int
 
-	if header[0] != byte(RecordTypeApplicationData) {
-		return 0, nil, ErrInvalidRecordHeader
-	}
-	payloadLen := int(binary.BigEndian.Uint16(header[3:5]))
-	if payloadLen <= 0 || payloadLen > MaxCiphertextLength {
-		return 0, nil, ErrCiphertextTooLarge
-	}
+	for {
+		header := make([]byte, RecordHeaderLen)
+		if _, err := io.ReadFull(r, header); err != nil {
+			return 0, nil, fmt.Errorf("read record header: %w", err)
+		}
 
-	fullRecord := make([]byte, RecordHeaderLen+payloadLen)
-	copy(fullRecord[:RecordHeaderLen], header)
-	if _, err := io.ReadFull(r, fullRecord[RecordHeaderLen:]); err != nil {
-		return 0, nil, fmt.Errorf("read record payload: %w", err)
-	}
+		if header[0] != byte(RecordTypeApplicationData) {
+			return 0, nil, ErrInvalidRecordHeader
+		}
+		payloadLen := int(binary.BigEndian.Uint16(header[3:5]))
+		if payloadLen <= 0 || payloadLen > MaxCiphertextLength {
+			return 0, nil, ErrCiphertextTooLarge
+		}
 
-	recType, plaintext, err := cipher.Unseal(fullRecord)
-	if err != nil {
-		return 0, nil, fmt.Errorf("unseal record: %w", err)
-	}
-	if recType != RecordTypeHandshake {
-		return 0, nil, fmt.Errorf("teetls: expected handshake record type (22), got %d", recType)
-	}
+		fullRecord := make([]byte, RecordHeaderLen+payloadLen)
+		copy(fullRecord[:RecordHeaderLen], header)
+		if _, err := io.ReadFull(r, fullRecord[RecordHeaderLen:]); err != nil {
+			return 0, nil, fmt.Errorf("read record payload: %w", err)
+		}
 
-	// Parse handshake header: 1 byte type + 3 bytes length
-	if len(plaintext) < HandshakeHeaderLen {
-		return 0, nil, errors.New("teetls: decrypted handshake fragment too short")
-	}
-	msgType := plaintext[0]
-	msgLen := int(plaintext[1])<<16 | int(plaintext[2])<<8 | int(plaintext[3])
-	if msgLen != len(plaintext)-HandshakeHeaderLen {
-		return 0, nil, errors.New("teetls: handshake message length mismatch in record")
-	}
+		recType, plaintext, err := cipher.Unseal(fullRecord)
+		if err != nil {
+			return 0, nil, fmt.Errorf("unseal record: %w", err)
+		}
+		if recType != RecordTypeHandshake {
+			return 0, nil, fmt.Errorf("teetls: expected handshake record type (22), got %d", recType)
+		}
 
-	return msgType, plaintext[HandshakeHeaderLen:], nil
+		assembled = append(assembled, plaintext...)
+
+		if expectedTotalLen == 0 && len(assembled) >= HandshakeHeaderLen {
+			msgType = assembled[0]
+			msgLen := int(assembled[1])<<16 | int(assembled[2])<<8 | int(assembled[3])
+			if msgLen < 0 || msgLen > 1<<24 {
+				return 0, nil, errors.New("teetls: invalid handshake message length")
+			}
+			expectedTotalLen = HandshakeHeaderLen + msgLen
+		}
+
+		if expectedTotalLen > 0 && len(assembled) >= expectedTotalLen {
+			if len(assembled) > expectedTotalLen {
+				return 0, nil, errors.New("teetls: excess data in handshake fragment")
+			}
+			return msgType, assembled[HandshakeHeaderLen:], nil
+		}
+	}
 }
 
-// writeEncryptedHandshakeMsg seals a handshake message into a RecordTypeHandshake record and writes it to w.
+// writeEncryptedHandshakeMsg seals a handshake message into RecordTypeHandshake record(s) and writes it to w.
 func writeEncryptedHandshakeMsg(w io.Writer, cipher *RecordCipher, msgType uint8, body []byte) error {
 	hsMsg := encodeHandshakeMsg(msgType, body)
-	record, err := cipher.Seal(RecordTypeHandshake, hsMsg)
-	if err != nil {
-		return fmt.Errorf("seal handshake record: %w", err)
-	}
-	if _, err := w.Write(record); err != nil {
-		return fmt.Errorf("write record: %w", err)
+	for len(hsMsg) > 0 {
+		chunkSize := len(hsMsg)
+		if chunkSize > MaxPlaintextLength {
+			chunkSize = MaxPlaintextLength
+		}
+		record, err := cipher.Seal(RecordTypeHandshake, hsMsg[:chunkSize])
+		if err != nil {
+			return fmt.Errorf("seal handshake record: %w", err)
+		}
+		if _, err := w.Write(record); err != nil {
+			return fmt.Errorf("write record: %w", err)
+		}
+		hsMsg = hsMsg[chunkSize:]
 	}
 	return nil
 }
