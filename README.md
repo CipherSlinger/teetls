@@ -15,7 +15,7 @@ It provides confidential computing communication channels where TLS peer certifi
 - **RFC 8998 Compliant**: TLS 1.3 ShangMi cipher suite (`TLS_SM4_GCM_SM3`, `0x00c6`) using SM2 key exchange, SM3 hash, and SM4-GCM record encryption.
 - **Hygon CSV Remote Attestation**:
   - Embedded CSV guest driver (`pkg/csvattest`) supporting direct `/dev/csv-guest` ioctls.
-  - ASN.1/DER X.509 evidence extension (`1.3.6.1.4.1.58287.1.1`) embedding CSV reports and certificate chains into ephemeral certificates.
+  - ASN.1/DER X.509 evidence extension (`1.3.6.1.4.1.58270.1.1`) embedding CSV reports and certificate chains into ephemeral certificates.
   - Anti-MITM public key binding: verifies that the CSV report's `USER_DATA` matches the SM3 digest of the peer's SM2 public key.
   - Comprehensive certificate chain verification (HRK &rarr; HSK &rarr; CEK &rarr; PEK).
   - Flexible measurement verification: **Strict** mode (rejects unauthorized measurements) and **Permissive** mode (logs warnings for audit).
@@ -55,6 +55,43 @@ It provides confidential computing communication channels where TLS peer certifi
                          | 4. Bidirectional Encrypted Application Data     |
                          |<===============================================>|
 ```
+
+### Trust Model & Key Separation
+
+A fundamental design aspect of RA-TLS is that **the identity authentication key is NOT directly the Hygon TEE hardware key**. Instead, an ephemeral SM2 key pair is generated in enclave memory and cryptographically bound to the TEE hardware report.
+
+```
++-----------------------------------------------------------+
+| Hygon Root CA (HRK)                                       |
+|   │ signs                                                 |
+| Hygon Sign Key (HSK) & Chip Endorsement Key (CEK)         |
+|   │ signs                                                 |
+| Platform Endorsement Key (PEK) ── Hardware Private Key    |
++──────────────────────────┬────────────────────────────────+
+                           │ Signs CSV Report
+                           ▼
++───────────────────────────────────────────────────────────+
+| Hygon CSV Attestation Report                              |
+|   - MEASURE   : Enclave launch digest (code integrity)    |
+|   - USER_DATA : SM3(Ephemeral Certificate SM2 Public Key) |
++──────────────────────────┬────────────────────────────────+
+                           │ Cryptographic Hash Binding
+                           ▼
++───────────────────────────────────────────────────────────+
+| Ephemeral X.509 Certificate (SM2 Public Key)              |
+|   - Verifies TLS 1.3 CertificateVerify signature          |
++-----------------------------------------------------------+
+```
+
+#### Why not use the TEE hardware key directly?
+1. **Hardware Key Isolation**: Hardware private keys (CEK, PEK) reside exclusively inside the Hygon Security Processor (PSP) / secure hardware and can never be exported to guest software.
+2. **Preventing Signature Oracles**: TEE hardware only signs structured attestation reports; it intentionally does not expose arbitrary data signing primitives to prevent attackers from abusing hardware keys to forge platform or firmware credentials.
+3. **High Handshake Performance**: Generating and signing with in-memory SM2 keys avoids costly hardware context switches and ioctl traps on every TLS connection.
+
+#### Two SM2 Keys in RFC 8998 TLS 1.3
+Standard RFC 8998 TLS 1.3 maintains two distinct SM2 key pairs with strict separation of duties:
+1. **Ephemeral Key Share (`curveSM2`)**: Generated dynamically during `ClientHello`/`ServerHello`. Used solely for ECDHE key exchange and HKDF-SM3 derivation of SM4-GCM record encryption keys, ensuring **Perfect Forward Secrecy (PFS)**.
+2. **Certificate Identity Key (`sm2sig_sm3`)**: Embedded in the X.509 certificate and bound to the CSV report's `USER_DATA`. Used strictly for `CertificateVerify` signatures to authenticate the enclave identity. The SM4 key derivation phase does not depend on or require knowledge of this certificate key.
 
 ---
 
