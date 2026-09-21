@@ -103,35 +103,58 @@ func writePlaintextHandshakeMsg(w io.Writer, msgType uint8, body []byte) ([]byte
 	return hsMsg, nil
 }
 
-// readPlaintextHandshakeMsg reads a TLSPlaintext record from r and decodes the handshake message.
+// maxHandshakeBufferSize limits the maximum buffered handshake data to prevent resource exhaustion.
+const maxHandshakeBufferSize = 2 * 1024 * 1024
+
+// readPlaintextHandshakeMsg reads a TLSPlaintext record from r and decodes the handshake message,
+// assembling across multiple plaintext records if fragmented.
 func readPlaintextHandshakeMsg(r io.Reader) (uint8, []byte, []byte, error) {
-	header := make([]byte, RecordHeaderLen)
-	if _, err := io.ReadFull(r, header); err != nil {
-		return 0, nil, nil, fmt.Errorf("read plaintext record header: %w", err)
-	}
+	var assembled []byte
+	var msgType uint8
+	var expectedTotalLen int
 
-	if header[0] != byte(RecordTypeHandshake) {
-		return 0, nil, nil, fmt.Errorf("teetls: expected plaintext handshake record (22), got %d", header[0])
-	}
+	for {
+		header := make([]byte, RecordHeaderLen)
+		if _, err := io.ReadFull(r, header); err != nil {
+			return 0, nil, nil, fmt.Errorf("read plaintext record header: %w", err)
+		}
 
-	payloadLen := int(binary.BigEndian.Uint16(header[3:5]))
-	if payloadLen < HandshakeHeaderLen || payloadLen > MaxPlaintextLength {
-		return 0, nil, nil, fmt.Errorf("teetls: invalid plaintext handshake record payload length %d", payloadLen)
-	}
+		if header[0] != byte(RecordTypeHandshake) {
+			return 0, nil, nil, fmt.Errorf("teetls: expected plaintext handshake record (22), got %d", header[0])
+		}
 
-	hsMsg := make([]byte, payloadLen)
-	if _, err := io.ReadFull(r, hsMsg); err != nil {
-		return 0, nil, nil, fmt.Errorf("read plaintext handshake payload: %w", err)
-	}
+		payloadLen := int(binary.BigEndian.Uint16(header[3:5]))
+		if payloadLen <= 0 || payloadLen > MaxPlaintextLength {
+			return 0, nil, nil, fmt.Errorf("teetls: invalid plaintext handshake record payload length %d", payloadLen)
+		}
 
-	msgType := hsMsg[0]
-	msgLen := int(hsMsg[1])<<16 | int(hsMsg[2])<<8 | int(hsMsg[3])
-	if msgLen != payloadLen-HandshakeHeaderLen {
-		return 0, nil, nil, fmt.Errorf("teetls: handshake message length mismatch: declared %d, record body %d", msgLen, payloadLen-HandshakeHeaderLen)
-	}
+		recordPayload := make([]byte, payloadLen)
+		if _, err := io.ReadFull(r, recordPayload); err != nil {
+			return 0, nil, nil, fmt.Errorf("read plaintext handshake payload: %w", err)
+		}
 
-	body := hsMsg[HandshakeHeaderLen:]
-	return msgType, body, hsMsg, nil
+		if len(assembled)+len(recordPayload) > maxHandshakeBufferSize {
+			return 0, nil, nil, errors.New("teetls: plaintext handshake buffer size limit exceeded")
+		}
+		assembled = append(assembled, recordPayload...)
+
+		if expectedTotalLen == 0 && len(assembled) >= HandshakeHeaderLen {
+			msgType = assembled[0]
+			msgLen := int(assembled[1])<<16 | int(assembled[2])<<8 | int(assembled[3])
+			if msgLen < 0 || msgLen > 1<<24 {
+				return 0, nil, nil, errors.New("teetls: invalid handshake message length")
+			}
+			expectedTotalLen = HandshakeHeaderLen + msgLen
+		}
+
+		if expectedTotalLen > 0 && len(assembled) >= expectedTotalLen {
+			if len(assembled) > expectedTotalLen {
+				return 0, nil, nil, errors.New("teetls: excess data in plaintext handshake fragment")
+			}
+			body := assembled[HandshakeHeaderLen:expectedTotalLen]
+			return msgType, body, assembled, nil
+		}
+	}
 }
 
 // readHandshakeMsg reads exactly one handshake message from an io.Reader without TLS record framing.
@@ -413,7 +436,9 @@ func ClientHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 	}
 
 	// 4. Read EncryptedExtensions (encrypted)
-	msgType, encExtensionsBody, err := readEncryptedHandshakeMsg(rawConn, serverHandshakeCipher)
+	hsReader := newEncryptedHandshakeReader(rawConn, serverHandshakeCipher)
+
+	msgType, encExtensionsBody, err := hsReader.ReadMsg()
 	if err != nil {
 		return nil, fmt.Errorf("teetls: read EncryptedExtensions: %w", err)
 	}
@@ -428,7 +453,7 @@ func ClientHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 	}
 
 	// 5. Read Certificate (encrypted)
-	msgType, certBody, err := readEncryptedHandshakeMsg(rawConn, serverHandshakeCipher)
+	msgType, certBody, err := hsReader.ReadMsg()
 	if err != nil {
 		return nil, fmt.Errorf("teetls: read server Certificate: %w", err)
 	}
@@ -458,7 +483,7 @@ func ClientHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 	copy(transcriptForVerify, transcript.Bytes())
 
 	// 6. Read CertificateVerify (encrypted)
-	msgType, sigBody, err := readEncryptedHandshakeMsg(rawConn, serverHandshakeCipher)
+	msgType, sigBody, err := hsReader.ReadMsg()
 	if err != nil {
 		return nil, fmt.Errorf("teetls: read CertificateVerify: %w", err)
 	}
@@ -477,7 +502,7 @@ func ClientHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 	copy(transcriptForServerFinished, transcript.Bytes())
 
 	// 7. Read Server Finished (encrypted)
-	msgType, finishedBody, err := readEncryptedHandshakeMsg(rawConn, serverHandshakeCipher)
+	msgType, finishedBody, err := hsReader.ReadMsg()
 	if err != nil {
 		return nil, fmt.Errorf("teetls: read Server Finished: %w", err)
 	}
@@ -490,6 +515,10 @@ func ClientHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 		return nil, errors.New("teetls: server finished HMAC verification failed")
 	}
 	transcript.Write(encodeHandshakeMsg(HandshakeTypeFinished, finishedBody))
+
+	if hsReader.HasRemaining() {
+		return nil, errors.New("teetls: unexpected trailing handshake data after server Finished")
+	}
 
 	// 8. If mutual attestation is negotiated, send Client Certificate & CertificateVerify
 	if mutualRequired {
@@ -683,10 +712,12 @@ func ServerHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 	var peerEvidence *CSVEvidenceExtension
 	var peerGCert *gx509.Certificate
 
+	hsReader := newEncryptedHandshakeReader(rawConn, clientHandshakeCipher)
+
 	// 8. If mutual attestation is required/performed, read Client Certificate & CertificateVerify
 	if cfg.VerifyMutualAttestation || clientRequestedMutual {
 		// Read client Certificate
-		msgType, clientCertBody, err := readEncryptedHandshakeMsg(rawConn, clientHandshakeCipher)
+		msgType, clientCertBody, err := hsReader.ReadMsg()
 		if err != nil {
 			return nil, fmt.Errorf("teetls: read client Certificate: %w", err)
 		}
@@ -719,7 +750,7 @@ func ServerHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 		copy(clientTranscriptForVerify, transcript.Bytes())
 
 		// Read client CertificateVerify
-		msgType, clientSigBody, err := readEncryptedHandshakeMsg(rawConn, clientHandshakeCipher)
+		msgType, clientSigBody, err := hsReader.ReadMsg()
 		if err != nil {
 			return nil, fmt.Errorf("teetls: read client CertificateVerify: %w", err)
 		}
@@ -737,7 +768,7 @@ func ServerHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 	// 9. Read Client Finished (encrypted)
 	expectedClientTag := computeHMACSM3(handshakeKeys.ClientFinishedKey, transcript.Bytes())
 
-	msgType, clientFinishedBody, err := readEncryptedHandshakeMsg(rawConn, clientHandshakeCipher)
+	msgType, clientFinishedBody, err := hsReader.ReadMsg()
 	if err != nil {
 		return nil, fmt.Errorf("teetls: read Client Finished: %w", err)
 	}
@@ -749,6 +780,10 @@ func ServerHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 		return nil, errors.New("teetls: client finished HMAC verification failed")
 	}
 	transcript.Write(encodeHandshakeMsg(HandshakeTypeFinished, clientFinishedBody))
+
+	if hsReader.HasRemaining() {
+		return nil, errors.New("teetls: unexpected trailing handshake data after client Finished")
+	}
 
 	// 10. Handshake complete! Derive application traffic keys bound to the full transcript hash.
 	finalTranscriptHash := sm3.Sm3Sum(transcript.Bytes())
@@ -776,15 +811,45 @@ func ServerHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 	}, nil
 }
 
-// readEncryptedHandshakeMsg reads one complete handshake message, assembling across fragmented TLS records if necessary.
-func readEncryptedHandshakeMsg(r io.Reader, cipher *RecordCipher) (uint8, []byte, error) {
-	var assembled []byte
-	var msgType uint8
-	var expectedTotalLen int
+// encryptedHandshakeReader buffers decrypted plaintext from TLSCiphertext records
+// and parses discrete handshake messages, supporting record coalescing and fragmentation.
+type encryptedHandshakeReader struct {
+	r      io.Reader
+	cipher *RecordCipher
+	buf    []byte
+}
 
+func newEncryptedHandshakeReader(r io.Reader, cipher *RecordCipher) *encryptedHandshakeReader {
+	return &encryptedHandshakeReader{
+		r:      r,
+		cipher: cipher,
+	}
+}
+
+// ReadMsg reads the next discrete handshake message. It unseals subsequent TLSCiphertext
+// records until at least one complete handshake message is buffered.
+func (hr *encryptedHandshakeReader) ReadMsg() (uint8, []byte, error) {
 	for {
+		if len(hr.buf) >= HandshakeHeaderLen {
+			msgLen := int(hr.buf[1])<<16 | int(hr.buf[2])<<8 | int(hr.buf[3])
+			if msgLen < 0 || msgLen > 1<<24 {
+				return 0, nil, errors.New("teetls: invalid handshake message length")
+			}
+			totalLen := HandshakeHeaderLen + msgLen
+			if totalLen > maxHandshakeBufferSize {
+				return 0, nil, errors.New("teetls: handshake message exceeds buffer limit")
+			}
+			if len(hr.buf) >= totalLen {
+				msgType := hr.buf[0]
+				body := make([]byte, msgLen)
+				copy(body, hr.buf[HandshakeHeaderLen:totalLen])
+				hr.buf = hr.buf[totalLen:]
+				return msgType, body, nil
+			}
+		}
+
 		header := make([]byte, RecordHeaderLen)
-		if _, err := io.ReadFull(r, header); err != nil {
+		if _, err := io.ReadFull(hr.r, header); err != nil {
 			return 0, nil, fmt.Errorf("read record header: %w", err)
 		}
 
@@ -798,11 +863,11 @@ func readEncryptedHandshakeMsg(r io.Reader, cipher *RecordCipher) (uint8, []byte
 
 		fullRecord := make([]byte, RecordHeaderLen+payloadLen)
 		copy(fullRecord[:RecordHeaderLen], header)
-		if _, err := io.ReadFull(r, fullRecord[RecordHeaderLen:]); err != nil {
+		if _, err := io.ReadFull(hr.r, fullRecord[RecordHeaderLen:]); err != nil {
 			return 0, nil, fmt.Errorf("read record payload: %w", err)
 		}
 
-		recType, plaintext, err := cipher.Unseal(fullRecord)
+		recType, plaintext, err := hr.cipher.Unseal(fullRecord)
 		if err != nil {
 			return 0, nil, fmt.Errorf("unseal record: %w", err)
 		}
@@ -810,24 +875,24 @@ func readEncryptedHandshakeMsg(r io.Reader, cipher *RecordCipher) (uint8, []byte
 			return 0, nil, fmt.Errorf("teetls: expected handshake record type (22), got %d", recType)
 		}
 
-		assembled = append(assembled, plaintext...)
-
-		if expectedTotalLen == 0 && len(assembled) >= HandshakeHeaderLen {
-			msgType = assembled[0]
-			msgLen := int(assembled[1])<<16 | int(assembled[2])<<8 | int(assembled[3])
-			if msgLen < 0 || msgLen > 1<<24 {
-				return 0, nil, errors.New("teetls: invalid handshake message length")
-			}
-			expectedTotalLen = HandshakeHeaderLen + msgLen
+		if len(hr.buf)+len(plaintext) > maxHandshakeBufferSize {
+			return 0, nil, errors.New("teetls: handshake message buffer limit exceeded")
 		}
 
-		if expectedTotalLen > 0 && len(assembled) >= expectedTotalLen {
-			if len(assembled) > expectedTotalLen {
-				return 0, nil, errors.New("teetls: excess data in handshake fragment")
-			}
-			return msgType, assembled[HandshakeHeaderLen:], nil
-		}
+		hr.buf = append(hr.buf, plaintext...)
 	}
+}
+
+// HasRemaining returns true if unparsed handshake plaintext remains in the reader's buffer.
+func (hr *encryptedHandshakeReader) HasRemaining() bool {
+	return len(hr.buf) > 0
+}
+
+// readEncryptedHandshakeMsg reads one complete handshake message from r using cipher.
+// Maintained for testing and compatibility.
+func readEncryptedHandshakeMsg(r io.Reader, cipher *RecordCipher) (uint8, []byte, error) {
+	reader := newEncryptedHandshakeReader(r, cipher)
+	return reader.ReadMsg()
 }
 
 // writeEncryptedHandshakeMsg seals a handshake message into RecordTypeHandshake record(s) and writes it to w.
