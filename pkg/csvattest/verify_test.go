@@ -12,15 +12,24 @@ import (
 )
 
 func TestLoadCertChainFromFiles_Success(t *testing.T) {
-	hrkPath := filepath.Join("..", "..", "deploy", "certs", "hrk.cert")
-	hskCekPath := filepath.Join("..", "..", "deploy", "certs", "hsk_cek.cert")
-	if _, err := os.Stat(hrkPath); err != nil {
-		if _, errRoot := os.Stat("deploy/certs/hrk.cert"); errRoot == nil {
-			hrkPath = "deploy/certs/hrk.cert"
-			hskCekPath = "deploy/certs/hsk_cek.cert"
-		} else {
-			t.Skip("deploy/certs/hrk.cert not present, skipping real file test")
-		}
+	// Build the chain in a temporary directory rather than depending on
+	// deploy/certs, which is not part of the repository, so that the real
+	// file-loading path is exercised instead of skipped.
+	report, certs := newTestReport(t, true)
+	if len(report) != ReportSize {
+		t.Fatalf("test fixture report is %d bytes, want %d", len(report), ReportSize)
+	}
+
+	dir := t.TempDir()
+	hrkPath := filepath.Join(dir, "hrk.cert")
+	hskCekPath := filepath.Join(dir, "hsk_cek.cert")
+
+	if err := os.WriteFile(hrkPath, certs.hrk, 0o600); err != nil {
+		t.Fatalf("write hrk cert: %v", err)
+	}
+	hskCek := append(append([]byte(nil), certs.hsk...), certs.cek...)
+	if err := os.WriteFile(hskCekPath, hskCek, 0o600); err != nil {
+		t.Fatalf("write hsk_cek cert: %v", err)
 	}
 
 	chain, err := LoadCertChainFromFiles(hrkPath, hskCekPath)
@@ -35,6 +44,61 @@ func TestLoadCertChainFromFiles_Success(t *testing.T) {
 	}
 	if chain.Source != "local file" {
 		t.Errorf("chain.Source = %q, want %q", chain.Source, "local file")
+	}
+}
+
+// TestLoadCertChainFromFiles_NormalisesTrailingBytes verifies that a trailing
+// newline, which is what a plain file read of a provisioned certificate usually
+// leaves behind, does not change the loaded material.
+func TestLoadCertChainFromFiles_NormalisesTrailingBytes(t *testing.T) {
+	_, certs := newTestReport(t, true)
+
+	dir := t.TempDir()
+	hrkPath := filepath.Join(dir, "hrk.cert")
+	hskCekPath := filepath.Join(dir, "hsk_cek.cert")
+
+	if err := os.WriteFile(hrkPath, append(append([]byte(nil), certs.hrk...), '\n'), 0o600); err != nil {
+		t.Fatalf("write hrk cert: %v", err)
+	}
+	hskCek := append(append(append([]byte(nil), certs.hsk...), certs.cek...), '\n')
+	if err := os.WriteFile(hskCekPath, hskCek, 0o600); err != nil {
+		t.Fatalf("write hsk_cek cert: %v", err)
+	}
+
+	chain, err := LoadCertChainFromFiles(hrkPath, hskCekPath)
+	if err != nil {
+		t.Fatalf("LoadCertChainFromFiles() error = %v", err)
+	}
+	if len(chain.HRK) != HrkCertSize {
+		t.Errorf("len(chain.HRK) = %d, want %d", len(chain.HRK), HrkCertSize)
+	}
+	if len(chain.HSKCEK) != HskCekSize {
+		t.Errorf("len(chain.HSKCEK) = %d, want %d", len(chain.HSKCEK), HskCekSize)
+	}
+	if !bytes.Equal(chain.HRK, certs.hrk) {
+		t.Error("loaded HRK differs from the certificate on disk")
+	}
+}
+
+// TestLoadCertChainFromFiles_ShortFile verifies that a truncated certificate is
+// rejected rather than silently accepted with a short length.
+func TestLoadCertChainFromFiles_ShortFile(t *testing.T) {
+	_, certs := newTestReport(t, true)
+
+	dir := t.TempDir()
+	hrkPath := filepath.Join(dir, "hrk.cert")
+	hskCekPath := filepath.Join(dir, "hsk_cek.cert")
+
+	if err := os.WriteFile(hrkPath, certs.hrk[:HrkCertSize-1], 0o600); err != nil {
+		t.Fatalf("write short hrk cert: %v", err)
+	}
+	hskCek := append(append([]byte(nil), certs.hsk...), certs.cek...)
+	if err := os.WriteFile(hskCekPath, hskCek, 0o600); err != nil {
+		t.Fatalf("write hsk_cek cert: %v", err)
+	}
+
+	if _, err := LoadCertChainFromFiles(hrkPath, hskCekPath); err == nil {
+		t.Fatal("LoadCertChainFromFiles() accepted a truncated HRK certificate")
 	}
 }
 
