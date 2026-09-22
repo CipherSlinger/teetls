@@ -1,5 +1,8 @@
 # teetls
 
+> **TEE-TLS / RA-TLS transport for Go** — ShangMi cryptography + Hygon CSV remote
+> attestation, exposed as a drop-in `net.Conn`, `net.Listener`, and `net/http` transport.
+
 [![Go Reference](https://pkg.go.dev/badge/github.com/CipherSlinger/teetls.svg)](https://pkg.go.dev/github.com/CipherSlinger/teetls)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
@@ -8,6 +11,23 @@
 It provides `net.Conn`, `net.Listener`, and `net/http` integration where an ephemeral SM2 certificate key is cryptographically bound to a CSV attestation report. The verifier checks the report signature, the Hygon certificate chain, the public-key binding in `USER_DATA`, and the configured measurement whitelist.
 
 > Compatibility note: this project uses TLS 1.3 concepts and ShangMi primitives, but the current wire protocol is custom and interoperates with `teetls` peers. It should not be described as wire-compatible with arbitrary RFC 8446 / RFC 8998 TLS implementations unless a standard-compatible handshake is implemented separately.
+
+---
+
+## Contents
+
+- [Features](#features)
+- [Protocol Overview](#protocol-overview)
+- [Trust Model and Key Separation](#trust-model-and-key-separation)
+- [Offline Hygon Certificate Verification](#offline-hygon-certificate-verification)
+- [Installation](#installation)
+- [TCP Server Example](#tcp-server-example)
+- [TCP Client Example](#tcp-client-example)
+- [HTTP Client Integration](#http-client-integration)
+- [Testing and Debugging Modes](#testing-and-debugging-modes)
+- [Package Structure](#package-structure)
+- [Common Commands](#common-commands)
+- [Security Notes](#security-notes)
 
 ---
 
@@ -35,7 +55,147 @@ It provides `net.Conn`, `net.Listener`, and `net/http` integration where an ephe
 
 ---
 
-## Trust Model & Key Separation
+## Protocol Overview
+
+`teetls` runs a TLS 1.3-shaped handshake with ShangMi primitives: SM2 ephemeral key
+agreement, an SM3 transcript, and SM4-GCM record protection. The CSV attestation is
+**not** a separate packet or a custom record type — it is embedded as a DER-encoded
+X.509 extension inside the ephemeral SM2 certificate, which travels inside the
+encrypted `Certificate` handshake message. A sniffer therefore never sees an
+"attestation" record: the evidence is hidden inside ordinary encrypted traffic.
+
+### Handshake flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Server (Hygon CSV guest)
+
+    Note over C: ephemeral SM2 key + client_random
+    C->>S: ClientHello<br/>random + key_share(SM2) + mutual-attest flag
+
+    Note over S: ephemeral SM2 key + server_random
+    S->>S: ask /dev/csv-guest for a report<br/>USER_DATA[:32] = SM3(pubkey DER)
+    S->>C: ServerHello<br/>random + key_share(SM2)
+
+    Note over C,S: ECDHE(SM2) shared secret → HKDF-SM3 → handshake keys
+
+    S->>C: EncryptedExtensions
+    S->>C: Certificate (SM2 cert + CSV evidence extension)
+    S->>C: CertificateVerify (SM2 signature)
+    S->>C: Finished (HMAC-SM3)
+
+    Note over C: verify PEK signature, HRK→HSK→CEK→PEK chain,<br/>USER_DATA binding, measurement whitelist
+
+    C->>S: Finished (HMAC-SM3)
+
+    Note over C,S: derive application keys from the transcript hash
+
+    C->>S: Application Data (SM4-GCM)
+    S->>C: Application Data (SM4-GCM)
+```
+
+### What Wireshark sees
+
+Because TLS 1.3 hides the inner content type, only the two plaintext records
+(`ClientHello`, `ServerHello`) reveal themselves as handshake traffic. Everything
+after key derivation — including the `Certificate` that carries the CSV evidence —
+shows up as generic **Application Data**.
+
+```text
+No.  Time       Source     Destination  Protocol  Length  Info
+1    0.000000   10.0.0.2   10.0.0.1     TLSv1.3   161     Client Hello
+2    0.000128   10.0.0.1   10.0.0.2     TLSv1.3   160     Server Hello
+3    0.000133   10.0.0.1   10.0.0.2     TLSv1.3   81      Application Data (EncryptedExtensions)
+4    0.000135   10.0.0.1   10.0.0.2     TLSv1.3   6801    Application Data (Certificate)   ★ CSV evidence
+5    0.000136   10.0.0.1   10.0.0.2     TLSv1.3   152     Application Data (CertificateVerify)
+6    0.000137   10.0.0.1   10.0.0.2     TLSv1.3   112     Application Data (Finished)
+7    0.000141   10.0.0.2   10.0.0.1     TLSv1.3   112     Application Data (Finished)
+8    0.000145   10.0.0.2   10.0.0.1     TLSv1.3   200     Application Data
+9    0.000148   10.0.0.1   10.0.0.2     TLSv1.3   417     Application Data
+```
+
+Lengths are illustrative. Frame 4 is dominated by the attestation evidence: the
+report is `0x9f4` (2548) bytes, plus the optional HRK certificate `0x340` (832)
+and the HSK/CEK bundle `0xb64` (2916) bytes.
+
+### Inside the `Certificate` record
+
+Expanding frame 4 shows where the Hygon CSV evidence sits. The handshake message
+carries the SM2 certificate; the certificate's only extension is the CSV evidence.
+
+```text
+Frame 4: 6801 bytes on wire, 6801 bytes captured
+
+Ethernet II, Src: 52:54:00:00:00:01, Dst: 52:54:00:00:00:02
+Internet Protocol Version 4, Src: 10.0.0.1, Dst: 10.0.0.2
+Transmission Control Protocol, Src Port: 8443, Dst Port: 52134
+Transport Layer Security
+    TLSv1.3 Record Layer: Application Data Protocol
+        Content Type: Application Data (23)
+        Version: TLS 1.2 (0x0303)
+        Length: 6747
+        Encrypted Application Data: <SM4-GCM ciphertext>
+            [decrypted inner content type: Handshake (22)]
+    Handshake Protocol: Certificate
+        Handshake Type: Certificate (11)
+        Certificate Request Context Length: 0
+        Certificate: <SM2 X.509 certificate (PEM on the wire)>
+            tbsCertificate
+                subject: CN=TEE-TLS Ephemeral SM2 Certificate
+                subjectPublicKeyInfo: SM2 uncompressed point (0x04 ‖ X ‖ Y)
+                extensions: 1 item
+                    Extension: csvEvidence (1.3.6.1.4.1.58270.1.1)    ★ Hygon CSV
+                        critical: false
+                        value: DER-encoded CSVEvidenceExtension
+                            version: 1
+                            report:     2548 bytes (0x9f4)            ★ attestation report
+                            hrkCert:     832 bytes (0x340, optional)  ★ HRK
+                            hskCekCert: 2916 bytes (0xb64, optional)  ★ HSK/CEK
+            algorithmIdentifier: SM2-with-SM3
+            signatureValue: <SM2 signature>
+```
+
+### Where the evidence lives
+
+```text
+TLS 1.3 record — outer ContentType = 23 "Application Data" (SM4-GCM, inner type hidden)
+`-- Handshake message — type 11 "Certificate"
+    `-- X.509 certificate — ephemeral SM2 identity key, self-signed
+        |-- subjectPublicKeyInfo : ephemeral SM2 public key
+        |-- signature            : SM2withSM3 over tbsCertificate
+        `-- extensions
+            `-- CSV evidence extension (OID 1.3.6.1.4.1.58270.1.1)
+                |-- version  = 1
+                |-- report   = Hygon CSV attestation report (0x9f4)
+                |   |-- Hygon signature (r, s) over the report header
+                |   |-- PEK certificate (0x824)
+                |   |-- USER_DATA (64 B): first 32 B = SM3(pubkey DER)
+                |   `-- ChipID, MAC
+                |-- hrkCert     = HRK certificate (0x340, optional)
+                `-- hskCekCert  = HSK/CEK bundle (0xb64, optional)
+```
+
+The binding that makes this RA-TLS rather than a plain certificate exchange:
+
+```text
+USER_DATA[:32]  ==  SM3( subjectPublicKeyInfo )
+   │                        │
+   └─ written by the CSV     └─ derived from the ephemeral SM2 key
+      hardware attestation
+```
+
+**Embed and verify, step by step:**
+
+1. The guest generates an ephemeral SM2 key pair and computes `SM3(public key DER)`.
+2. The CSV hardware produces an attestation report whose `USER_DATA[:32]` holds that digest, signed by the PEK embedded in the report.
+3. The report plus the HRK / HSK-CEK chain are packed into a DER X.509 extension and embedded in a self-signed SM2 certificate.
+4. The certificate travels in the encrypted `Certificate` message. The peer verifies the PEK signature, the HRK→HSK→CEK→PEK chain, the `USER_DATA` binding, and (in strict mode) the measurement whitelist.
+
+---
+
+## Trust Model and Key Separation
 
 The identity authentication key is **not** the Hygon TEE hardware key. `teetls` generates an ephemeral SM2 key pair in the guest and binds that key to the CSV hardware report.
 
