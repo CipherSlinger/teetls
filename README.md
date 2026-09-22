@@ -82,6 +82,14 @@ Deployments may run without network access. Verification is therefore fail-close
 - A peer-supplied HRK is accepted only if it exactly matches the local trusted HRK.
 - Missing chain material fails verification unless `InsecureSkipAttestationVerify` is explicitly enabled.
 
+Chain material is resolved in a fixed order, and local material is never shadowed by what a peer sent:
+
+1. `HRKCertPath` + `HSKCekCertPath`, when both are set.
+2. `CertDir`, which must contain `hrk.cert` and `hsk_cek.cert`. The HRK anchor comes from the local file unless `TrustedHRKCert` is also set, in which case the in-memory anchor wins.
+3. The peer evidence extension, used for HSK/CEK intermediates only. It can never supply the trust anchor on its own, so an unanchored peer chain is rejected.
+
+`Config.Timeout` bounds the handshake on both sides (default 10s) and also bounds the TCP dial. A peer that connects and then stalls is disconnected once it expires; the deadline is cleared before application data flows.
+
 Expected enclave measurements are supplied in `Config.ExpectedMeasurements` and compared against the report measurement. In `ModeStrict`, an empty measurement whitelist is rejected for peer verification.
 
 ---
@@ -270,4 +278,5 @@ go vet ./...
 - Keep `ExpectedMeasurements` up to date with approved enclave builds.
 - Treat `ModePermissive` as an audit/debugging mode; it still verifies cryptographic evidence but does not reject measurement mismatches.
 - Treat `InsecureSkipAttestationVerify` as unsafe outside controlled tests.
+- The PEK signature covers only the first `SignedSize` (0xb4) bytes of the report. `sig_usage`, `sig_algo`, `A nonce`, the PEK certificate, the ChipID and the MAC lie outside that region and are not authenticated by it. That is the hardware ABI, not a choice made here: the `A nonce` is only an unmasking key, and the values it unmasks that matter — `USER_DATA` and the PEK certificate — are checked independently against the peer public key and the trusted chain. Do not build additional trust on those fields.
 - This repository does not currently claim general wire interoperability with `crypto/tls` or third-party TLS 1.3 stacks.
