@@ -218,7 +218,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 			return totalSent, fmt.Errorf("teetls: seal record: %w", err)
 		}
 
-		if _, err := c.rawConn.Write(record); err != nil {
+		if err := writeFull(c.rawConn, record); err != nil {
 			return totalSent, err
 		}
 
@@ -242,7 +242,7 @@ func (c *Conn) Close() error {
 			} else {
 				if err := c.rawConn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
 					alertErr = fmt.Errorf("teetls: set close_notify deadline: %w", err)
-				} else if _, err := c.rawConn.Write(record); err != nil {
+				} else if err := writeFull(c.rawConn, record); err != nil {
 					alertErr = fmt.Errorf("teetls: write close_notify: %w", err)
 				}
 			}

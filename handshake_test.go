@@ -12,6 +12,37 @@ import (
 	"time"
 )
 
+// shortWriter returns a short write with a nil error, exercising the
+// writeFull defence against non-conforming net.Conn implementations.
+type shortWriter struct {
+	w      io.Writer
+	max    int
+	writes int
+}
+
+func (s *shortWriter) Write(p []byte) (int, error) {
+	if s.writes < s.max {
+		s.writes++
+		return len(p) - 1, nil
+	}
+	return s.w.Write(p)
+}
+
+func TestWriteFull(t *testing.T) {
+	buf := &bytes.Buffer{}
+	if err := writeFull(buf, []byte("hello")); err != nil {
+		t.Fatalf("writeFull(full) error = %v, want nil", err)
+	}
+	if buf.String() != "hello" {
+		t.Fatalf("writeFull(full) wrote %q, want %q", buf.String(), "hello")
+	}
+
+	short := &shortWriter{w: &bytes.Buffer{}, max: 1}
+	if err := writeFull(short, []byte("hello")); err != io.ErrShortWrite {
+		t.Fatalf("writeFull(short) error = %v, want io.ErrShortWrite", err)
+	}
+}
+
 func newTestCiphers(t *testing.T) (*RecordCipher, *RecordCipher) {
 	t.Helper()
 	key := []byte("0123456789abcdef")

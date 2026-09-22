@@ -72,6 +72,22 @@ type HandshakeResult struct {
 // ErrMutualAttestationRequired indicates the server requires client attestation credentials.
 var ErrMutualAttestationRequired = errors.New("teetls: mutual attestation required")
 
+// writeFull writes p to w and fails on a short write. io.Writer requires a
+// non-nil error whenever n < len(p), but the record stream is the security
+// boundary and a buggy net.Conn has historically returned a short count with a
+// nil error. Checking n turns silent truncation into a hard error, matching
+// crypto/tls.
+func writeFull(w io.Writer, p []byte) error {
+	n, err := w.Write(p)
+	if err != nil {
+		return err
+	}
+	if n != len(p) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
 // encodeHandshakeMsg packs a handshake message with a 4-byte header: type (1 byte) + length (3 bytes).
 func encodeHandshakeMsg(msgType uint8, body []byte) []byte {
 	length := len(body)
@@ -98,7 +114,7 @@ func writePlaintextHandshakeMsg(w io.Writer, msgType uint8, body []byte) ([]byte
 	binary.BigEndian.PutUint16(record[3:5], uint16(len(hsMsg)))
 	copy(record[RecordHeaderLen:], hsMsg)
 
-	if _, err := w.Write(record); err != nil {
+	if err := writeFull(w, record); err != nil {
 		return nil, fmt.Errorf("write plaintext handshake record: %w", err)
 	}
 	return hsMsg, nil
@@ -894,7 +910,7 @@ func writeEncryptedHandshakeMsg(w io.Writer, cipher *RecordCipher, msgType uint8
 		if err != nil {
 			return fmt.Errorf("seal handshake record: %w", err)
 		}
-		if _, err := w.Write(record); err != nil {
+		if err := writeFull(w, record); err != nil {
 			return fmt.Errorf("write record: %w", err)
 		}
 		hsMsg = hsMsg[chunkSize:]
