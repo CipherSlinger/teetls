@@ -73,10 +73,9 @@ type HandshakeResult struct {
 var ErrMutualAttestationRequired = errors.New("teetls: mutual attestation required")
 
 // writeFull writes p to w and fails on a short write. io.Writer requires a
-// non-nil error whenever n < len(p), but the record stream is the security
-// boundary and a buggy net.Conn has historically returned a short count with a
-// nil error. Checking n turns silent truncation into a hard error, matching
-// crypto/tls.
+// non-nil error whenever n < len(p), but a buggy net.Conn has historically
+// returned a short count with a nil error. Checking n turns silent truncation
+// into a hard error, matching crypto/tls.
 func writeFull(w io.Writer, p []byte) error {
 	n, err := w.Write(p)
 	if err != nil {

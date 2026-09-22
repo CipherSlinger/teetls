@@ -12,20 +12,18 @@ import (
 	"time"
 )
 
-// shortWriter returns a short write with a nil error, exercising the
-// writeFull defence against non-conforming net.Conn implementations.
+// shortWriter reports a short write with a nil error, exercising the writeFull
+// defence against non-conforming net.Conn implementations.
 type shortWriter struct {
-	w      io.Writer
-	max    int
-	writes int
+	done bool
 }
 
 func (s *shortWriter) Write(p []byte) (int, error) {
-	if s.writes < s.max {
-		s.writes++
+	if !s.done {
+		s.done = true
 		return len(p) - 1, nil
 	}
-	return s.w.Write(p)
+	return len(p), nil
 }
 
 func TestWriteFull(t *testing.T) {
@@ -37,7 +35,7 @@ func TestWriteFull(t *testing.T) {
 		t.Fatalf("writeFull(full) wrote %q, want %q", buf.String(), "hello")
 	}
 
-	short := &shortWriter{w: &bytes.Buffer{}, max: 1}
+	short := &shortWriter{}
 	if err := writeFull(short, []byte("hello")); err != io.ErrShortWrite {
 		t.Fatalf("writeFull(short) error = %v, want io.ErrShortWrite", err)
 	}
