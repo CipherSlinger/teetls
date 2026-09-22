@@ -69,11 +69,17 @@ func (c *Client) GetSealingKeyIOCTL(keyBuf []byte) error {
 	if err != nil {
 		return err
 	}
+	// The report carries the sealing key in Reserved2. Clear it once it has been
+	// extracted, for the same reason GetAttestationReportIOCTL zeroes the field
+	// before copying out: key material must not linger in a heap buffer that
+	// outlives this call.
+	defer clear(report)
 	key, err := ExtractSealingKey(report)
 	if err != nil {
 		return err
 	}
 	copy(keyBuf, key)
+	clear(key)
 	return nil
 }
 
