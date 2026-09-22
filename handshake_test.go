@@ -2,11 +2,14 @@ package teetls
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"io"
 	"net"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func newTestCiphers(t *testing.T) (*RecordCipher, *RecordCipher) {
@@ -302,10 +305,79 @@ func TestReadPlaintextHandshakeMsg_FragmentationAndReassembly(t *testing.T) {
 	}
 }
 
+// coalescingConn delays everything written to it until the wrapped side is about
+// to read, so that records written one at a time by the handshake arrive at the
+// peer as a single contiguous stream. net.Pipe is synchronous and unbuffered, so
+// without a wrapper like this each Write is delivered to its own Read and record
+// coalescing can never be exercised.
+type coalescingConn struct {
+	net.Conn
+
+	mu      sync.Mutex
+	pending []byte
+	// writes counts the Write calls accumulated since the last flush.
+	writes int
+	// flushes records, in order, the byte chunks handed to the underlying
+	// connection together with the number of Write calls each one coalesced.
+	flushes []flushBatch
+}
+
+type flushBatch struct {
+	data   []byte
+	writes int
+}
+
+func (c *coalescingConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pending = append(c.pending, p...)
+	c.writes++
+	return len(p), nil
+}
+
+func (c *coalescingConn) Read(p []byte) (int, error) {
+	if err := c.flush(); err != nil {
+		return 0, err
+	}
+	return c.Conn.Read(p)
+}
+
+// flush hands the buffered bytes to the underlying connection in a single Write.
+func (c *coalescingConn) flush() error {
+	c.mu.Lock()
+	batch := flushBatch{data: c.pending, writes: c.writes}
+	c.pending = nil
+	c.writes = 0
+	if len(batch.data) > 0 {
+		c.flushes = append(c.flushes, batch)
+	}
+	c.mu.Unlock()
+
+	if len(batch.data) == 0 {
+		return nil
+	}
+	_, err := c.Conn.Write(batch.data)
+	return err
+}
+
+// countRecords returns the number of complete TLS records at the start of b.
+func countRecords(b []byte) int {
+	n := 0
+	for len(b) >= RecordHeaderLen {
+		length := int(binary.BigEndian.Uint16(b[3:5]))
+		if len(b) < RecordHeaderLen+length {
+			break
+		}
+		b = b[RecordHeaderLen+length:]
+		n++
+	}
+	return n
+}
+
 func TestHandshake_CoalescedServerMessages_EndToEnd(t *testing.T) {
-	// Test full client and server handshake where encrypted server messages
-	// (EncryptedExtensions, Certificate, CertificateVerify, Finished)
-	// are coalesced into a single encrypted record via a custom buffered pipe wrapper.
+	// Full client and server handshake where the server's encrypted flight
+	// (EncryptedExtensions, Certificate, CertificateVerify, Finished) is written
+	// as separate records but delivered to the client as one contiguous chunk.
 	mockProv := NewMockEvidenceProvider()
 	serverCfg := &Config{
 		Mode:             ModeStrict,
@@ -319,9 +391,11 @@ func TestHandshake_CoalescedServerMessages_EndToEnd(t *testing.T) {
 		},
 	}
 
-	clientConn, serverConn := net.Pipe()
+	clientConn, rawServerConn := net.Pipe()
 	defer clientConn.Close()
-	defer serverConn.Close()
+	defer rawServerConn.Close()
+
+	serverConn := &coalescingConn{Conn: rawServerConn}
 
 	errCh := make(chan error, 2)
 
@@ -347,5 +421,207 @@ func TestHandshake_CoalescedServerMessages_EndToEnd(t *testing.T) {
 		if err != nil {
 			t.Fatalf("handshake error: %v", err)
 		}
+	}
+
+	// The server must have batched several record writes into its first flush.
+	// If it had not, the client would only ever have seen one record at a time
+	// and the reader's coalescing path would be untested.
+	serverConn.mu.Lock()
+	flushes := append([]flushBatch(nil), serverConn.flushes...)
+	serverConn.mu.Unlock()
+
+	if len(flushes) == 0 {
+		t.Fatal("server never wrote anything through the coalescing connection")
+	}
+	first := flushes[0]
+	if first.writes < 2 {
+		t.Fatalf("first server flush coalesced %d Write call(s), want at least 2", first.writes)
+	}
+	if records := countRecords(first.data); records < 2 {
+		t.Fatalf("first server flush carried %d complete record(s), want at least 2", records)
+	}
+
+	// Whatever the batching, the whole session must still have been delivered.
+	total := 0
+	for _, f := range flushes {
+		total += countRecords(f.data)
+	}
+	if total < 2 {
+		t.Fatalf("server wrote %d record(s) in total, want at least 2", total)
+	}
+}
+
+// deadlineRecordingConn records every deadline the handshake applies to a
+// connection, so that the tests can assert on the bound without depending on how
+// long the (comparatively expensive) SM2 and SM3 work happens to take.
+type deadlineRecordingConn struct {
+	net.Conn
+
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func (c *deadlineRecordingConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadlines = append(c.deadlines, t)
+	c.mu.Unlock()
+	return c.Conn.SetDeadline(t)
+}
+
+func (c *deadlineRecordingConn) recordedDeadlines() []time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]time.Time(nil), c.deadlines...)
+}
+
+// TestServerHandshakeContext_StalledPeerTimesOut verifies that a peer which
+// connects and then sends nothing cannot hold the server goroutine open beyond
+// Config.Timeout.
+func TestServerHandshakeContext_StalledPeerTimesOut(t *testing.T) {
+	// Comfortably longer than the server's certificate preparation, so that what
+	// is measured below is the blocked read of the ClientHello and not an
+	// earlier failure.
+	timeout := time.Second
+	mockProv := NewMockEvidenceProvider()
+	cfg := &Config{
+		Mode:             ModeStrict,
+		EvidenceProvider: mockProv,
+		Timeout:          timeout,
+	}
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := ServerHandshakeContext(context.Background(), serverConn, cfg)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("expected the stalled handshake to fail, got nil error")
+		}
+		if elapsed < timeout {
+			t.Fatalf("handshake gave up after %v, before Config.Timeout of %v", elapsed, timeout)
+		}
+		if elapsed > 20*timeout {
+			t.Fatalf("handshake took %v, far beyond Config.Timeout of %v", elapsed, timeout)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("ServerHandshakeContext did not return; the handshake is not bounded by Config.Timeout")
+	}
+}
+
+// TestServerHandshakeContext_DeadlineLifecycle verifies that the server bounds
+// the handshake with a deadline and then clears it, and that application data
+// flows afterwards.
+//
+// The deadline is asserted on directly rather than by sleeping past Config.Timeout:
+// a sleep would have to outlast the handshake itself, which is slow enough under
+// the race detector to make the test flaky.
+func TestServerHandshakeContext_DeadlineLifecycle(t *testing.T) {
+	mockProv := NewMockEvidenceProvider()
+	serverCfg := &Config{
+		Mode:             ModeStrict,
+		EvidenceProvider: mockProv,
+		Timeout:          60 * time.Second,
+	}
+	clientCfg := &Config{
+		Mode:                 ModeStrict,
+		EvidenceProvider:     mockProv,
+		Timeout:              60 * time.Second,
+		ExpectedMeasurements: []string{mockProv.GetMeasurementHex()},
+	}
+
+	clientConn, rawServerConn := net.Pipe()
+	defer clientConn.Close()
+	defer rawServerConn.Close()
+	serverConn := &deadlineRecordingConn{Conn: rawServerConn}
+
+	type result struct {
+		res *HandshakeResult
+		err error
+	}
+	serverCh := make(chan result, 1)
+	clientCh := make(chan result, 1)
+
+	go func() {
+		res, err := ServerHandshakeContext(context.Background(), serverConn, serverCfg)
+		serverCh <- result{res, err}
+	}()
+	go func() {
+		res, err := ClientHandshakeContext(context.Background(), clientConn, clientCfg)
+		clientCh <- result{res, err}
+	}()
+
+	// Both handshakes must finish. Bound the waits so that a failure reports
+	// itself instead of hanging the suite.
+	var server, client result
+	for i := 0; i < 2; i++ {
+		select {
+		case server = <-serverCh:
+			serverCh = nil
+		case client = <-clientCh:
+			clientCh = nil
+		case <-time.After(60 * time.Second):
+			t.Fatal("handshake did not complete; the deadline may be cutting it short")
+		}
+	}
+	if server.err != nil {
+		t.Fatalf("server handshake error: %v", server.err)
+	}
+	if client.err != nil {
+		t.Fatalf("client handshake error: %v", client.err)
+	}
+
+	// The server must have bounded the handshake with a real deadline...
+	deadlines := serverConn.recordedDeadlines()
+	if len(deadlines) == 0 {
+		t.Fatal("server handshake never set a deadline on the connection")
+	}
+	if deadlines[0].IsZero() {
+		t.Fatal("server handshake did not bound itself with a deadline")
+	}
+	// ...and cleared it again, so that no handshake deadline is left behind on a
+	// connection that is about to carry application data.
+	if last := deadlines[len(deadlines)-1]; !last.IsZero() {
+		t.Fatalf("server handshake left deadline %v on the connection, want it cleared", last)
+	}
+
+	// Application data must flow over the finished connection.
+	payload := []byte("application data after the handshake")
+	record, err := client.res.OutCipher.Seal(RecordTypeApplicationData, payload)
+	if err != nil {
+		t.Fatalf("seal application data: %v", err)
+	}
+
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := clientConn.Write(record)
+		writeErr <- err
+	}()
+
+	buf := make([]byte, len(record))
+	if _, err := io.ReadFull(serverConn, buf); err != nil {
+		t.Fatalf("read application data after the handshake: %v", err)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("write application data after the handshake: %v", err)
+	}
+
+	contentType, got, err := server.res.InCipher.Unseal(buf)
+	if err != nil {
+		t.Fatalf("unseal application data: %v", err)
+	}
+	if contentType != RecordTypeApplicationData {
+		t.Fatalf("content type = %d, want %d", contentType, RecordTypeApplicationData)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload = %q, want %q", got, payload)
 	}
 }
