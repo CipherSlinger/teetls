@@ -2,6 +2,7 @@ package teetls
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -30,6 +31,15 @@ func Listen(network, addr string, cfg *Config) (net.Listener, error) {
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("teetls: invalid listen config: %w", err)
+	}
+	// A server must be able to produce a certificate for its handshake. Fail
+	// fast here rather than at the first Accept, mirroring
+	// GetOrGenerateCertificateContext's own error.
+	if len(cfg.CertPEM) == 0 && len(cfg.KeyPEM) == 0 && cfg.EvidenceProvider == nil {
+		return nil, errors.New("teetls: requires either CertPEM/KeyPEM or EvidenceProvider")
+	}
+	if cfg.mode() == ModeStrict && cfg.VerifyMutualAttestation && !cfg.InsecureSkipAttestationVerify && len(cfg.ExpectedMeasurements) == 0 {
+		return nil, fmt.Errorf("teetls: server listening in strict mode with mutual attestation requires ExpectedMeasurements")
 	}
 
 	l, err := net.Listen(network, addr)
