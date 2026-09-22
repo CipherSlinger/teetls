@@ -194,6 +194,21 @@ func VerifyReportPEKSignature(res *VerificationResult) error {
 	if res == nil {
 		return errors.New("verification result is nil")
 	}
+	// VerificationResult is exported and its fields are settable, and this
+	// exported entry point is documented as taking one, so a caller can build a
+	// result directly. Every field sliced below is therefore length-checked
+	// first: without these checks a short PEKCert panics on the slice expression
+	// and a short Signature panics inside ParseHygonSignature, turning a caller
+	// mistake into a crash. Requiring the full CSVCertSize rather than the 16
+	// bytes the slice itself needs also covers the reads parseHygonPubKey
+	// performs inside the certificate, and ParseReport always supplies exactly
+	// that many bytes.
+	if len(res.PEKCert) < CSVCertSize {
+		return fmt.Errorf("%w: PEK certificate is %d bytes, need %d", ErrShortBuffer, len(res.PEKCert), CSVCertSize)
+	}
+	if len(res.Signature) < OffsetHygonSigS+32 {
+		return fmt.Errorf("%w: report signature is %d bytes, need %d", ErrShortBuffer, len(res.Signature), OffsetHygonSigS+32)
+	}
 	pekPub, err := parseHygonPubKey(res.PEKCert[OffsetCSVPubKey:])
 	if err != nil {
 		return fmt.Errorf("failed to parse PEK public key from report: %w", err)
@@ -481,7 +496,18 @@ func verifyHygonSignature(pub *hygonPubKey, msg []byte, sig []byte) bool {
 	return sm2.Sm2Verify(pub.Key, msg, pub.UserID, r, s)
 }
 
+// ParseHygonSignature splits a Hygon signature blob into its r and s halves.
+//
+// The layout is fixed: r occupies bytes [OffsetHygonSigR, OffsetHygonSigR+32)
+// and s occupies [OffsetHygonSigS, OffsetHygonSigS+32), with padding between
+// them, so sig must be at least OffsetHygonSigS+32 bytes. A shorter buffer
+// yields (0, 0) rather than a slice-bounds panic. Zero is the fail-closed
+// choice: sm2.Sm2Verify rejects r and s outside [1, N-1], so any verification
+// that consumes them fails rather than accepting.
 func ParseHygonSignature(sig []byte) (*big.Int, *big.Int) {
+	if len(sig) < OffsetHygonSigS+32 {
+		return new(big.Int), new(big.Int)
+	}
 	r := new(big.Int).SetBytes(ReverseCopy(sig[OffsetHygonSigR : OffsetHygonSigR+32]))
 	s := new(big.Int).SetBytes(ReverseCopy(sig[OffsetHygonSigS : OffsetHygonSigS+32]))
 	return r, s

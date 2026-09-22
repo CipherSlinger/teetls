@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
@@ -232,6 +234,78 @@ func TestVerifyReportPEKSignature_Nil(t *testing.T) {
 	}
 }
 
+// TestVerifyReportPEKSignature_RejectsShortFields checks that a caller-built
+// VerificationResult with a truncated PEK certificate or report signature is
+// rejected with an error instead of panicking on a slice expression.
+func TestVerifyReportPEKSignature_RejectsShortFields(t *testing.T) {
+	// Parse a genuine report so the PEK certificate is a real one: without that,
+	// the short-Signature case would be masked by a public-key parse failure and
+	// would pass for the wrong reason.
+	full, err := ParseReport(mustTestReport(t, false))
+	if err != nil {
+		t.Fatalf("ParseReport() error = %v", err)
+	}
+	if err := VerifyReportPEKSignature(full); err != nil {
+		t.Fatalf("VerifyReportPEKSignature(valid report) error = %v, want nil", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*VerificationResult)
+	}{
+		{"nil PEKCert", func(r *VerificationResult) { r.PEKCert = nil }},
+		{"short PEKCert", func(r *VerificationResult) { r.PEKCert = r.PEKCert[:4] }},
+		{"PEKCert one byte short", func(r *VerificationResult) { r.PEKCert = r.PEKCert[:CSVCertSize-1] }},
+		{"nil Signature", func(r *VerificationResult) { r.Signature = nil }},
+		{"short Signature", func(r *VerificationResult) { r.Signature = make([]byte, OffsetHygonSigS+31) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := *full
+			tc.mutate(&res)
+			err := VerifyReportPEKSignature(&res)
+			if !errors.Is(err, ErrShortBuffer) {
+				t.Fatalf("VerifyReportPEKSignature(%s) error = %v, want ErrShortBuffer", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestParseHygonSignature_ShortBuffer pins the fail-closed contract of the
+// exported parser: a short buffer yields zero values, and zero values cannot
+// satisfy sm2.Sm2Verify's requirement that r and s lie in [1, N-1].
+func TestParseHygonSignature_ShortBuffer(t *testing.T) {
+	for _, n := range []int{0, 1, 64, OffsetHygonSigS + 31} {
+		r, s := ParseHygonSignature(make([]byte, n))
+		if r.Sign() != 0 || s.Sign() != 0 {
+			t.Fatalf("ParseHygonSignature(len=%d) = (%v, %v), want (0, 0)", n, r, s)
+		}
+	}
+
+	// The minimum accepted length must still parse r and s as distinct halves.
+	sig := make([]byte, OffsetHygonSigS+32)
+	sig[0] = 1 // r = 1
+	sig[OffsetHygonSigS] = 2
+	r, s := ParseHygonSignature(sig)
+	if r.Int64() != 1 || s.Int64() != 2 {
+		t.Fatalf("ParseHygonSignature(minimum length) = (%v, %v), want (1, 2)", r, s)
+	}
+
+	// Zero r and s are rejected by the verifier, which is what makes the
+	// short-buffer branch fail closed rather than accept.
+	key, err := sm2.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate SM2 key: %v", err)
+	}
+	if sm2.Sm2Verify(&key.PublicKey, []byte("msg"), nil, r, s) {
+		t.Fatal("sm2.Sm2Verify accepted r=1, s=2")
+	}
+	zero := new(big.Int)
+	if sm2.Sm2Verify(&key.PublicKey, []byte("msg"), nil, zero, zero) {
+		t.Fatal("sm2.Sm2Verify accepted (0, 0)")
+	}
+}
+
 type testAttestationCerts struct {
 	hrk []byte
 	hsk []byte
@@ -288,6 +362,14 @@ func leftPad32(in []byte) []byte {
 	out := make([]byte, 32)
 	copy(out[32-len(in):], in)
 	return out
+}
+
+// mustTestReport returns only the report from newTestReport, for tests that do
+// not need the certificate chain.
+func mustTestReport(t *testing.T, withChain bool) []byte {
+	t.Helper()
+	report, _ := newTestReport(t, withChain)
+	return report
 }
 
 func newTestReport(t *testing.T, withChain bool) ([]byte, *testAttestationCerts) {
