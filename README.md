@@ -443,3 +443,4 @@ go vet ./...
 - Treat `InsecureSkipAttestationVerify` as unsafe outside controlled tests.
 - The PEK signature covers only the first `SignedSize` (0xb4) bytes of the report. `sig_usage`, `sig_algo`, `A nonce`, the PEK certificate, the ChipID and the MAC lie outside that region and are not authenticated by it. That is the hardware ABI, not a choice made here: the `A nonce` is only an unmasking key, and the values it unmasks that matter — `USER_DATA` and the PEK certificate — are checked independently against the peer public key and the trusted chain. Do not build additional trust on those fields.
 - This repository does not currently claim general wire interoperability with `crypto/tls` or third-party TLS 1.3 stacks.
+- teetls performs no server hostname, SNI, or DNS-name verification. A peer's identity is established solely by the attestation measurement whitelist plus the ephemeral-key binding, so the dial address must not be relied on for authentication.
