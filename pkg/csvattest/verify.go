@@ -5,19 +5,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"math/big"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/tjfoc/gmsm/sm2"
 )
-
-var DownloadCertFunc = DownloadCert
 
 var (
 	// ErrMissingCertChain indicates that chain verification was requested without local chain material.
@@ -27,32 +22,34 @@ var (
 )
 
 type VerificationResult struct {
-	ReportSize        int
-	PubkeyDigest      []byte
-	VMID              []byte
-	VMVersion         []byte
-	UserData          []byte
-	MNonce            []byte
-	Digest            []byte
-	Policy            uint32
-	SigUsage          uint32
-	SigAlgo           uint32
-	ANonce            uint32
-	Signature         []byte
-	PEKCert           []byte
-	ChipID            []byte
-	ChipIDASCII       string
-	Reserved2         []byte
-	MAC               []byte
-	PEKDetails        CSVCertDetails
-	ReportVerified    bool
-	ChainVerified     bool
-	ChainSource       string
-	ChainDownloadNote string
-	HRKURL            string
-	HSKCEKURL         string
-	CertDetails       *CertChainDetails
-	rawReport         []byte
+	ReportSize     int
+	PubkeyDigest   []byte
+	VMID           []byte
+	VMVersion      []byte
+	UserData       []byte
+	MNonce         []byte
+	Digest         []byte
+	Policy         uint32
+	SigUsage       uint32
+	SigAlgo        uint32
+	ANonce         uint32
+	Signature      []byte
+	PEKCert        []byte
+	ChipID         []byte
+	ChipIDASCII    string
+	Reserved2      []byte
+	MAC            []byte
+	PEKDetails     CSVCertDetails
+	ReportVerified bool
+	ChainVerified  bool
+	ChainSource    string
+	// HRKURL and HSKCEKURL are informational: they record where the chain
+	// material for this chip would be published, for out-of-band provisioning.
+	// Verification never fetches them.
+	HRKURL      string
+	HSKCEKURL   string
+	CertDetails *CertChainDetails
+	rawReport   []byte
 }
 
 type PubKeyDetails struct {
@@ -87,12 +84,10 @@ type CertChainDetails struct {
 }
 
 type CertChainInput struct {
-	HRK          []byte
-	HSKCEK       []byte
-	Source       string
-	DownloadNote string
-	HRKURL       string
-	HSKCEKURL    string
+	HRK    []byte
+	HSKCEK []byte
+	// Source describes where the chain material was read from, for diagnostics.
+	Source string
 }
 
 func (c *Client) VerifyAttestationReport(reportBuf []byte, verifyChain bool) error {
@@ -180,14 +175,14 @@ func ParseReport(data []byte) (*VerificationResult, error) {
 
 	chipIDASCII, err := ChipIDASCII(result.ChipID)
 	if err != nil {
-		return result, fmt.Errorf("解析 ChipID 失败: %w", err)
+		return result, fmt.Errorf("failed to parse ChipID: %w", err)
 	}
 	result.ChipIDASCII = chipIDASCII
 	result.HSKCEKURL = KDSCertURL + url.QueryEscape(chipIDASCII)
 
 	pekDetails, err := ParseCSVCertDetails(pekCert)
 	if err != nil {
-		return result, fmt.Errorf("解析报告内 PEK 证书失败: %w", err)
+		return result, fmt.Errorf("failed to parse PEK certificate from report: %w", err)
 	}
 	result.PEKDetails = pekDetails
 
@@ -201,26 +196,27 @@ func VerifyReportPEKSignature(res *VerificationResult) error {
 	}
 	pekPub, err := parseHygonPubKey(res.PEKCert[OffsetCSVPubKey:])
 	if err != nil {
-		return fmt.Errorf("解析报告内 PEK 公钥失败: %w", err)
+		return fmt.Errorf("failed to parse PEK public key from report: %w", err)
 	}
+
+	// The PEK signature covers exactly the first SignedSize bytes of the report
+	// as they appear on the wire, i.e. with the masked fields still masked.
+	// ParseReport always materialises a full ReportSize buffer, which is larger
+	// than SignedSize, so the raw bytes are always available.
+	//
+	// The signed region stops at OffsetReportSigUsage, so SigUsage, SigAlgo, the
+	// A nonce, the PEK certificate, the ChipID and the MAC are not covered by it.
+	// That is the hardware ABI and not something this layer can change: the A
+	// nonce is only an unmasking key, and every value it unmasks that matters
+	// here is checked independently downstream (USER_DATA against the peer
+	// public key, the PEK certificate against the trusted chain). Callers must
+	// not rely on those fields being authenticated.
+	if len(res.rawReport) < SignedSize {
+		return fmt.Errorf("%w: report is %d bytes, need at least %d", ErrShortBuffer, len(res.rawReport), SignedSize)
+	}
+	signed := res.rawReport[:SignedSize]
 
 	r, s := ParseHygonSignature(res.Signature)
-	var signed []byte
-	if len(res.rawReport) >= SignedSize {
-		signed = res.rawReport[:SignedSize]
-	} else {
-		signed = make([]byte, SignedSize)
-		copy(signed[OffsetReportPubkeyDigest:], res.PubkeyDigest)
-		copy(signed[OffsetReportVMID:], res.VMID)
-		copy(signed[OffsetReportVMVersion:], res.VMVersion)
-		copy(signed[OffsetUserData:], UnmaskWords(res.UserData, res.ANonce))
-		copy(signed[OffsetMNonce:], UnmaskWords(res.MNonce, res.ANonce))
-		copy(signed[OffsetMeasure:], UnmaskWords(res.Digest, res.ANonce))
-		policyBytes := make([]byte, 4)
-		binary.LittleEndian.PutUint32(policyBytes, res.Policy)
-		copy(signed[OffsetReportPolicy:], UnmaskWords(policyBytes, res.ANonce))
-	}
-
 	if !sm2.Sm2Verify(pekPub.Key, signed, pekPub.UserID, r, s) {
 		return errors.New("PEK report signature verification failed")
 	}
@@ -251,13 +247,6 @@ func VerifyReportWithOptions(data []byte, opts VerifyOptions) (*VerificationResu
 	}
 
 	res.ChainSource = certs.Source
-	res.ChainDownloadNote = certs.DownloadNote
-	if certs.HRKURL != "" {
-		res.HRKURL = certs.HRKURL
-	}
-	if certs.HSKCEKURL != "" {
-		res.HSKCEKURL = certs.HSKCEKURL
-	}
 
 	details, err := VerifyCertChain(certs, res.PEKCert)
 	if details != nil {
@@ -339,40 +328,15 @@ func LoadCertChain(certDir string, chipIDASCII string) (*CertChainInput, error) 
 
 // LoadLocalCertChain loads certificates from a directory containing hrk.cert and hsk_cek.cert.
 func LoadLocalCertChain(certDir string) (*CertChainInput, error) {
-	chain, err := LoadCertChainFromFiles(filepath.Join(certDir, "hrk.cert"), filepath.Join(certDir, "hsk_cek.cert"))
-	if err != nil {
-		return nil, err
-	}
-	chain.Source = "本地文件"
-	return chain, nil
-}
-
-func DownloadCert(rawURL string, expectedSize int) ([]byte, error) {
-	client := http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(rawURL)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP 状态码 %d", resp.StatusCode)
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(expectedSize+4096)))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) < expectedSize {
-		return nil, fmt.Errorf("证书长度不足: %d bytes, 需要至少 %d bytes", len(data), expectedSize)
-	}
-	return data[:expectedSize], nil
+	return LoadCertChainFromFiles(filepath.Join(certDir, "hrk.cert"), filepath.Join(certDir, "hsk_cek.cert"))
 }
 
 func VerifyCertChain(certs *CertChainInput, pekCert []byte) (*CertChainDetails, error) {
 	if len(certs.HRK) < HrkCertSize {
-		return nil, fmt.Errorf("hrk.cert 长度不足: %d", len(certs.HRK))
+		return nil, fmt.Errorf("hrk.cert is %d bytes, need at least %d", len(certs.HRK), HrkCertSize)
 	}
 	if len(certs.HSKCEK) < HskCekSize {
-		return nil, fmt.Errorf("hsk_cek.cert 长度不足: %d", len(certs.HSKCEK))
+		return nil, fmt.Errorf("hsk_cek.cert is %d bytes, need at least %d", len(certs.HSKCEK), HskCekSize)
 	}
 	hrk := certs.HRK[:HrkCertSize]
 	hsk := certs.HSKCEK[:HrkCertSize]
@@ -487,7 +451,7 @@ func parseHygonPubKey(data []byte) (*hygonPubKey, error) {
 
 func ParseRootCertDetails(cert []byte) (RootCertDetails, error) {
 	if len(cert) < HrkCertSize {
-		return RootCertDetails{}, fmt.Errorf("证书长度不足: %d", len(cert))
+		return RootCertDetails{}, fmt.Errorf("certificate is %d bytes, need at least %d", len(cert), HrkCertSize)
 	}
 	pub, err := parseHygonPubKey(cert[OffsetRootPubKey:])
 	if err != nil {
@@ -498,7 +462,7 @@ func ParseRootCertDetails(cert []byte) (RootCertDetails, error) {
 
 func ParseCSVCertDetails(cert []byte) (CSVCertDetails, error) {
 	if len(cert) < CSVCertSize {
-		return CSVCertDetails{}, fmt.Errorf("证书长度不足: %d", len(cert))
+		return CSVCertDetails{}, fmt.Errorf("certificate is %d bytes, need at least %d", len(cert), CSVCertSize)
 	}
 	pub, err := parseHygonPubKey(cert[OffsetCSVPubKey:])
 	if err != nil {
@@ -526,11 +490,11 @@ func ParseHygonSignature(sig []byte) (*big.Int, *big.Int) {
 func ChipIDASCII(chipID []byte) (string, error) {
 	trimmed := strings.TrimSpace(strings.TrimRight(string(chipID), "\x00"))
 	if trimmed == "" {
-		return "", errors.New("ChipID 为空")
+		return "", errors.New("ChipID is empty")
 	}
 	for _, b := range []byte(trimmed) {
 		if b < 0x20 || b > 0x7e {
-			return "", fmt.Errorf("ChipID 包含不可打印字符: 0x%02x", b)
+			return "", fmt.Errorf("ChipID contains a non-printable character: 0x%02x", b)
 		}
 	}
 	return trimmed, nil
@@ -542,7 +506,7 @@ func readFixedFile(path string, size int) ([]byte, error) {
 		return nil, err
 	}
 	if len(data) < size {
-		return nil, fmt.Errorf("文件长度不足: %d bytes, 需要至少 %d bytes", len(data), size)
+		return nil, fmt.Errorf("file is %d bytes, need at least %d", len(data), size)
 	}
 	return data[:size], nil
 }

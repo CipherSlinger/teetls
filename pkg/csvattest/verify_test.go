@@ -124,8 +124,8 @@ func TestLoadLocalCertChain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadLocalCertChain() error = %v", err)
 	}
-	if chain.Source != "本地文件" {
-		t.Errorf("chain.Source = %q, want %q", chain.Source, "本地文件")
+	if chain.Source != "local file" {
+		t.Errorf("chain.Source = %q, want %q", chain.Source, "local file")
 	}
 }
 
@@ -142,13 +142,6 @@ func TestVerifyReportData_Delegation(t *testing.T) {
 	if err := os.WriteFile(hskCekPath, hskCek, 0o600); err != nil {
 		t.Fatalf("failed to write hsk_cek: %v", err)
 	}
-
-	// Mock DownloadCertFunc to fail so it falls back to local certDir
-	oldDownload := DownloadCertFunc
-	DownloadCertFunc = func(rawURL string, expectedSize int) ([]byte, error) {
-		return nil, os.ErrNotExist
-	}
-	defer func() { DownloadCertFunc = oldDownload }()
 
 	res, err := VerifyReportData(report, dir, true)
 	if err != nil {
