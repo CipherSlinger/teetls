@@ -222,6 +222,12 @@ func (h *HygonHardwareProvider) GetEvidence(pubKeyDigest [32]byte) (*CSVEvidence
 }
 
 // GetMeasurementHex extracts the measurement hash from hardware report or returns empty if not available.
+//
+// This performs a full attestation report fetch, including a fresh nonce, so it
+// is a hardware round trip and not a cheap accessor. Every failure is reported
+// as the empty string, which can never match a report digest; Config.Validate
+// rejects such an entry, so a caller that builds a whitelist from this value
+// gets a configuration error rather than a handshake that always fails.
 func (h *HygonHardwareProvider) GetMeasurementHex() string {
 	// Dummy digest for hardware query
 	var dummy [32]byte

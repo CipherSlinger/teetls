@@ -88,9 +88,11 @@ Chain material is resolved in a fixed order, and local material is never shadowe
 2. `CertDir`, which must contain `hrk.cert` and `hsk_cek.cert`. The HRK anchor comes from the local file unless `TrustedHRKCert` is also set, in which case the in-memory anchor wins.
 3. The peer evidence extension, used for HSK/CEK intermediates only. It can never supply the trust anchor on its own, so an unanchored peer chain is rejected.
 
-`Config.Timeout` bounds the handshake on both sides (default 10s) and also bounds the TCP dial. A peer that connects and then stalls is disconnected once it expires; the deadline is cleared before application data flows.
+`Config.Timeout` (default 10s) bounds the TCP dial and the handshake. The client bounds its handshake through `Dial`/`DialContext`, which applies the caller's context deadline and `Config.Timeout`, whichever comes first; the server bounds its own side inside `ServerHandshakeContext`, so a peer that connects and then stalls is disconnected once the timeout expires. A handshake deadline is always cleared before application data flows. Calling `ClientHandshake`/`ClientHandshakeContext` directly bypasses the client-side bound, so a caller that does so must apply its own deadline to the connection.
 
-Expected enclave measurements are supplied in `Config.ExpectedMeasurements` and compared against the report measurement. In `ModeStrict`, an empty measurement whitelist is rejected for peer verification.
+Expected enclave measurements are supplied in `Config.ExpectedMeasurements` and compared against the report measurement. Each entry must be exactly 64 hex characters — the length of the 32-byte SM3 digest it is compared against — and `Config.Validate` rejects any other shape at `Dial`, `Listen` and handshake time. Letter case is free. An entry that is not 64 hex characters can never match, so rejecting it up front turns a silent, permanent handshake failure into a configuration error. This also catches the empty string that `HygonHardwareProvider.GetMeasurementHex` returns when the attestation ioctl fails. In `ModeStrict`, an empty measurement whitelist is rejected for peer verification.
+
+Attestation evidence carries a version field. Only version `1` is encoded and accepted; any other value fails closed on both encode and decode.
 
 ---
 
@@ -253,6 +255,7 @@ cfg := &teetls.Config{
 - `provider.go`: evidence provider abstraction, Hygon hardware provider, and mock provider.
 - `verifier.go`: certificate/evidence verification, public-key binding, measurement checks.
 - `transport.go`: `Dial`, `Listen`, and HTTP integration.
+- `doc.go`: package documentation.
 - `pkg/csvattest`: CSV report parsing, PEK signature verification, chain verification, and device access helpers.
 
 ---
@@ -275,7 +278,7 @@ go vet ./...
 ## Security Notes
 
 - Keep the trusted HRK anchor immutable and provisioned out-of-band.
-- Keep `ExpectedMeasurements` up to date with approved enclave builds.
+- Keep `ExpectedMeasurements` up to date with approved enclave builds. Entries are validated as 64 hex characters, but the value itself must still come from a measurement you obtained out-of-band from the enclave you intend to trust.
 - Treat `ModePermissive` as an audit/debugging mode; it still verifies cryptographic evidence but does not reject measurement mismatches.
 - Treat `InsecureSkipAttestationVerify` as unsafe outside controlled tests.
 - The PEK signature covers only the first `SignedSize` (0xb4) bytes of the report. `sig_usage`, `sig_algo`, `A nonce`, the PEK certificate, the ChipID and the MAC lie outside that region and are not authenticated by it. That is the hardware ABI, not a choice made here: the `A nonce` is only an unmasking key, and the values it unmasks that matter — `USER_DATA` and the PEK certificate — are checked independently against the peer public key and the trusted chain. Do not build additional trust on those fields.
