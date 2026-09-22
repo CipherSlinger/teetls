@@ -1,4 +1,4 @@
-//go:build csv_hardware && linux && amd64
+//go:build csv_hardware && linux
 
 package csvattest
 

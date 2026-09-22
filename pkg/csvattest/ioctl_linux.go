@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build linux
 
 package csvattest
 
@@ -13,12 +13,6 @@ import (
 )
 
 type defaultPlatformOps struct{}
-
-type csvGuestMem struct {
-	VA   uintptr
-	Size int32
-	_    [4]byte
-}
 
 func (defaultPlatformOps) mmap(length int) ([]byte, error) {
 	return syscall.Mmap(-1, 0, length, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_ANON)
