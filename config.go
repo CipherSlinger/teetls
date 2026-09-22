@@ -8,6 +8,10 @@ import (
 	"time"
 )
 
+// defaultTimeout bounds dialing, handshaking and attestation verification when
+// Config.Timeout is unset.
+const defaultTimeout = 10 * time.Second
+
 // AttestationMode defines the policy mode for remote attestation verification.
 type AttestationMode string
 
@@ -131,18 +135,15 @@ func (c *Config) cachedCertificateValidLocked(ttl time.Duration) bool {
 	return time.Now().Add(time.Minute).Before(c.cachedNotAfter)
 }
 
-// Validate validates the configuration and applies sensible defaults.
+// Validate reports whether the configuration is structurally valid.
+//
+// It never modifies the receiver. A single Config is routinely shared by many
+// concurrent connections (see Listen), so Validate must remain safe to call
+// from those goroutines; defaults are applied at their point of use through
+// mode and timeout instead.
 func (c *Config) Validate() error {
-	if c.Mode == "" {
-		c.Mode = ModeStrict
-	}
-
-	if c.Mode != ModeStrict && c.Mode != ModePermissive {
+	if c.Mode != "" && c.Mode != ModeStrict && c.Mode != ModePermissive {
 		return fmt.Errorf("invalid attestation mode: %q (must be %q or %q)", c.Mode, ModeStrict, ModePermissive)
-	}
-
-	if c.Timeout <= 0 {
-		c.Timeout = 10 * time.Second
 	}
 
 	if (len(c.CertPEM) == 0) != (len(c.KeyPEM) == 0) {
@@ -154,4 +155,20 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+// mode returns the effective attestation mode, defaulting to ModeStrict.
+func (c *Config) mode() AttestationMode {
+	if c.Mode == "" {
+		return ModeStrict
+	}
+	return c.Mode
+}
+
+// timeout returns the effective timeout, defaulting to defaultTimeout.
+func (c *Config) timeout() time.Duration {
+	if c.Timeout <= 0 {
+		return defaultTimeout
+	}
+	return c.Timeout
 }

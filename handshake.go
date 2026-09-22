@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"time"
 
 	"github.com/tjfoc/gmsm/sm2"
 	"github.com/tjfoc/gmsm/sm3"
@@ -157,24 +158,6 @@ func readPlaintextHandshakeMsg(r io.Reader) (uint8, []byte, []byte, error) {
 	}
 }
 
-// readHandshakeMsg reads exactly one handshake message from an io.Reader without TLS record framing.
-func readHandshakeMsg(r io.Reader) (uint8, []byte, error) {
-	header := make([]byte, HandshakeHeaderLen)
-	if _, err := io.ReadFull(r, header); err != nil {
-		return 0, nil, err
-	}
-	msgType := header[0]
-	length := int(header[1])<<16 | int(header[2])<<8 | int(header[3])
-	if length < 0 || length > 1<<24 {
-		return 0, nil, errors.New("teetls: handshake message too large")
-	}
-	body := make([]byte, length)
-	if _, err := io.ReadFull(r, body); err != nil {
-		return 0, nil, err
-	}
-	return msgType, body, nil
-}
-
 // encodePublicKeySM2 serializes an SM2 public key as 65 uncompressed bytes (0x04 || X[32] || Y[32]).
 func encodePublicKeySM2(pub *sm2.PublicKey) []byte {
 	raw := make([]byte, SM2UncompressedPubKeyLen)
@@ -296,11 +279,6 @@ func deriveApplicationTrafficKeys(sharedSecret, transcriptHash []byte) (*Applica
 	}
 
 	return keys, nil
-}
-
-// deriveKeys is kept for backward compatibility, returning handshake keys.
-func deriveKeys(sharedSecret, clientRandom, serverRandom []byte) (*HandshakeTrafficKeys, error) {
-	return deriveHandshakeTrafficKeys(sharedSecret, clientRandom, serverRandom)
 }
 
 // computeHMACSM3 calculates HMAC-SM3 over the input data using the given key.
@@ -584,6 +562,10 @@ func ServerHandshake(rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 }
 
 // ServerHandshakeContext executes the server-side handshake with cancellable local operations.
+//
+// The handshake is bounded by cfg.Timeout so that a peer which connects and
+// then stalls cannot hold a goroutine and a file descriptor indefinitely. Any
+// deadline set here is cleared once the handshake finishes.
 func ServerHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) (*HandshakeResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -594,6 +576,11 @@ func ServerHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("teetls: invalid server config: %w", err)
 	}
+
+	if err := rawConn.SetDeadline(time.Now().Add(cfg.timeout())); err != nil {
+		return nil, fmt.Errorf("teetls: set handshake deadline: %w", err)
+	}
+	defer func() { _ = rawConn.SetDeadline(time.Time{}) }()
 
 	// Prepare server SM2 certificate and private key
 	serverCertPEM, serverPriv, err := prepareServerCertificateContext(ctx, cfg)

@@ -56,14 +56,12 @@ func DialContext(ctx context.Context, network, addr string, cfg *Config) (*Conn,
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("teetls: invalid dial config: %w", err)
 	}
-	if cfg.Mode == ModeStrict && !cfg.InsecureSkipAttestationVerify && len(cfg.ExpectedMeasurements) == 0 {
+	if cfg.mode() == ModeStrict && !cfg.InsecureSkipAttestationVerify && len(cfg.ExpectedMeasurements) == 0 {
 		return nil, fmt.Errorf("teetls: client dialing in strict mode requires ExpectedMeasurements")
 	}
 
 	var d net.Dialer
-	if cfg.Timeout > 0 {
-		d.Timeout = cfg.Timeout
-	}
+	d.Timeout = cfg.timeout()
 
 	rawConn, err := d.DialContext(ctx, network, addr)
 	if err != nil {
@@ -74,19 +72,23 @@ func DialContext(ctx context.Context, network, addr string, cfg *Config) (*Conn,
 	if d, ok := ctx.Deadline(); ok {
 		deadline = d
 	}
-	if cfg.Timeout > 0 {
-		timeoutDeadline := time.Now().Add(cfg.Timeout)
-		if deadline.IsZero() || timeoutDeadline.Before(deadline) {
-			deadline = timeoutDeadline
-		}
+	// Bound the handshake by both the caller's context deadline and the
+	// configured timeout, whichever expires first.
+	if timeoutDeadline := time.Now().Add(cfg.timeout()); deadline.IsZero() || timeoutDeadline.Before(deadline) {
+		deadline = timeoutDeadline
 	}
 	if !deadline.IsZero() {
 		_ = rawConn.SetDeadline(deadline)
 	}
 
+	// The watcher must be fully stopped before the handshake deadline is
+	// cleared, otherwise a context cancellation racing with the clear could
+	// leave an already-expired deadline on a connection that is about to be
+	// handed back to the caller for application data.
 	ctxDone := make(chan struct{})
-	defer close(ctxDone)
+	watcherDone := make(chan struct{})
 	go func() {
+		defer close(watcherDone)
 		select {
 		case <-ctx.Done():
 			_ = rawConn.SetDeadline(time.Now())
@@ -95,12 +97,17 @@ func DialContext(ctx context.Context, network, addr string, cfg *Config) (*Conn,
 	}()
 
 	conn := NewClientConn(rawConn, cfg)
-	if err := conn.handshake(ctx); err != nil {
+	handshakeErr := conn.handshake(ctx)
+
+	close(ctxDone)
+	<-watcherDone
+
+	if handshakeErr != nil {
 		conn.Close()
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("teetls: dial %s: %w", addr, ctx.Err())
 		}
-		return nil, fmt.Errorf("teetls: handshake failed: %w", err)
+		return nil, fmt.Errorf("teetls: handshake failed: %w", handshakeErr)
 	}
 
 	_ = rawConn.SetDeadline(time.Time{})
@@ -123,9 +130,9 @@ func NewHTTPTransport(cfg *Config) *http.Transport {
 
 // NewHTTPClient creates an http.Client equipped with TEE-TLS 1.3 Transport and configured timeout.
 func NewHTTPClient(cfg *Config) *http.Client {
-	timeout := 10 * time.Second
-	if cfg != nil && cfg.Timeout > 0 {
-		timeout = cfg.Timeout
+	timeout := defaultTimeout
+	if cfg != nil {
+		timeout = cfg.timeout()
 	}
 	return &http.Client{
 		Transport: NewHTTPTransport(cfg),
