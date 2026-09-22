@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -478,6 +479,72 @@ func TestHandshake_CoalescedServerMessages_EndToEnd(t *testing.T) {
 	if total < 2 {
 		t.Fatalf("server wrote %d record(s) in total, want at least 2", total)
 	}
+}
+
+// flagFlipConn rewrites the mutual-attestation flag byte in the plaintext
+// ClientHello it forwards, simulating an on-path attacker clearing the client's
+// request to attest itself. The flag travels outside the authenticated
+// transcript, so the flip is undetectable until the server's authenticated
+// EncryptedExtensions fails to echo mutual attestation back.
+type flagFlipConn struct {
+	net.Conn
+	flipped bool
+}
+
+func (c *flagFlipConn) Write(p []byte) (int, error) {
+	if !c.flipped && len(p) > RecordHeaderLen &&
+		p[0] == byte(RecordTypeHandshake) && p[RecordHeaderLen] == HandshakeTypeClientHello {
+		c.flipped = true
+		buf := append([]byte(nil), p...)
+		// The mutual-attestation flag is the final byte of the ClientHello record.
+		buf[len(buf)-1] = 0
+		_, err := c.Conn.Write(buf)
+		return len(p), err
+	}
+	return c.Conn.Write(p)
+}
+
+// TestMutualAttestationDowngradeRejected verifies that a client which asked to
+// attest itself rejects the handshake when an on-path attacker clears the
+// plaintext mutual-attestation flag and the server therefore fails to require
+// client attestation in its authenticated EncryptedExtensions.
+func TestMutualAttestationDowngradeRejected(t *testing.T) {
+	mockProv := NewMockEvidenceProvider()
+	serverCfg := &Config{
+		Mode:             ModeStrict,
+		EvidenceProvider: mockProv,
+	}
+	clientCfg := &Config{
+		Mode:                    ModeStrict,
+		EvidenceProvider:        mockProv,
+		VerifyMutualAttestation: true,
+		ExpectedMeasurements:    []string{mockProv.GetMeasurementHex()},
+	}
+
+	clientConn, rawServerConn := net.Pipe()
+	defer rawServerConn.Close()
+
+	// The client's ClientHello passes through flagFlipConn, so the server sees
+	// the mutual-attestation flag cleared and omits mutual from its
+	// EncryptedExtensions.
+	clientConn = &flagFlipConn{Conn: clientConn}
+	defer clientConn.Close()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		_, err := ServerHandshake(rawServerConn, serverCfg)
+		serverDone <- err
+	}()
+
+	_, err := ClientHandshake(clientConn, clientCfg)
+	if !errors.Is(err, ErrMutualAttestationNotConfirmed) {
+		t.Fatalf("client error = %v, want ErrMutualAttestationNotConfirmed", err)
+	}
+
+	// Closing the client end unblocks the server, which is waiting for a Finished
+	// message the downgrade-rejecting client will never send.
+	clientConn.Close()
+	<-serverDone
 }
 
 // deadlineRecordingConn records every deadline the handshake applies to a
