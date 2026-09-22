@@ -12,6 +12,14 @@ import (
 // OIDCSVEvidence is the registered ASN.1 Object Identifier for Hygon CSV RA-TLS evidence.
 var OIDCSVEvidence = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 58270, 1, 1}
 
+// EvidenceVersion is the only csv evidence layout version this package encodes
+// or accepts. Decoding fails closed on any other value rather than silently
+// treating unknown evidence as version 1.
+const EvidenceVersion = 1
+
+// errNilEvidence is returned when an evidence extension is passed as nil.
+var errNilEvidence = errors.New("nil evidence extension")
+
 // CSVEvidenceExtension holds the attestation report and cert chain for CSV RA-TLS.
 type CSVEvidenceExtension struct {
 	Version    int    `asn1:"optional,default:1"`
@@ -22,13 +30,18 @@ type CSVEvidenceExtension struct {
 
 // EncodeCSVEvidence encodes the evidence extension into a pkix.Extension.
 func EncodeCSVEvidence(ev *CSVEvidenceExtension) (pkix.Extension, error) {
-	if err := validateEvidenceExtension(ev); err != nil {
-		return pkix.Extension{}, err
+	if ev == nil {
+		return pkix.Extension{}, errNilEvidence
 	}
 
+	// A zero Version means the caller left the field unset; normalise it before
+	// validating so that the default is not rejected as an unknown version.
 	evCopy := *ev
 	if evCopy.Version == 0 {
-		evCopy.Version = 1
+		evCopy.Version = EvidenceVersion
+	}
+	if err := validateEvidenceExtension(&evCopy); err != nil {
+		return pkix.Extension{}, err
 	}
 
 	val, err := asn1.Marshal(evCopy)
@@ -60,7 +73,10 @@ func DecodeCSVEvidence(data []byte) (*CSVEvidenceExtension, error) {
 
 func validateEvidenceExtension(ev *CSVEvidenceExtension) error {
 	if ev == nil {
-		return errors.New("nil evidence extension")
+		return errNilEvidence
+	}
+	if ev.Version != EvidenceVersion {
+		return fmt.Errorf("unsupported csv evidence version %d, want %d", ev.Version, EvidenceVersion)
 	}
 	if len(ev.Report) != csvattest.ReportSize {
 		return fmt.Errorf("invalid report size in evidence extension: got %d, want %d", len(ev.Report), csvattest.ReportSize)

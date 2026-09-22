@@ -2,6 +2,7 @@ package teetls
 
 import (
 	"bytes"
+	"encoding/asn1"
 	"testing"
 
 	"github.com/CipherSlinger/teetls/pkg/csvattest"
@@ -94,6 +95,66 @@ func TestCSVEvidenceExtension_DefaultVersion(t *testing.T) {
 
 	if decoded.Version != 1 {
 		t.Errorf("expected version 1, got %d", decoded.Version)
+	}
+}
+
+func TestCSVEvidenceExtension_RejectsUnknownVersion(t *testing.T) {
+	report := bytes.Repeat([]byte{0xDD}, csvattest.ReportSize)
+
+	// Encoding a version this package does not define must fail rather than
+	// emit evidence that no conforming peer would accept.
+	for _, v := range []int{-1, 2, 99} {
+		if _, err := EncodeCSVEvidence(&CSVEvidenceExtension{Version: v, Report: report}); err == nil {
+			t.Errorf("EncodeCSVEvidence accepted version %d, want an error", v)
+		}
+	}
+
+	// Decoding must fail closed too: the version byte comes from the peer.
+	// A version outside the defined set cannot be produced by the encoder, so
+	// hand-build the DER with the same field layout.
+	for _, v := range []int{-1, 2, 99} {
+		der, err := asn1.Marshal(struct {
+			Version    int    `asn1:"optional,default:1"`
+			Report     []byte `asn1:"tag:0"`
+			HRKCert    []byte `asn1:"tag:1,optional,omitempty"`
+			HSKCekCert []byte `asn1:"tag:2,optional,omitempty"`
+		}{Version: v, Report: report})
+		if err != nil {
+			t.Fatalf("marshal evidence with version %d: %v", v, err)
+		}
+		if _, err := DecodeCSVEvidence(der); err == nil {
+			t.Errorf("DecodeCSVEvidence accepted version %d, want an error", v)
+		}
+	}
+
+	// The defined version, and an omitted field (which asn1 decodes as the
+	// declared default of 1), must both be accepted.
+	ext, err := EncodeCSVEvidence(&CSVEvidenceExtension{Version: EvidenceVersion, Report: report})
+	if err != nil {
+		t.Fatalf("EncodeCSVEvidence(version %d) failed: %v", EvidenceVersion, err)
+	}
+	decoded, err := DecodeCSVEvidence(ext.Value)
+	if err != nil {
+		t.Fatalf("DecodeCSVEvidence(version %d) failed: %v", EvidenceVersion, err)
+	}
+	if decoded.Version != EvidenceVersion {
+		t.Errorf("version = %d, want %d", decoded.Version, EvidenceVersion)
+	}
+
+	omitted, err := asn1.Marshal(struct {
+		Report     []byte `asn1:"tag:0"`
+		HRKCert    []byte `asn1:"tag:1,optional,omitempty"`
+		HSKCekCert []byte `asn1:"tag:2,optional,omitempty"`
+	}{Report: report})
+	if err != nil {
+		t.Fatalf("marshal evidence without a version field: %v", err)
+	}
+	decodedOmitted, err := DecodeCSVEvidence(omitted)
+	if err != nil {
+		t.Fatalf("DecodeCSVEvidence without a version field: %v", err)
+	}
+	if decodedOmitted.Version != EvidenceVersion {
+		t.Errorf("omitted version decoded as %d, want the default %d", decodedOmitted.Version, EvidenceVersion)
 	}
 }
 
