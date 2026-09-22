@@ -2,10 +2,13 @@ package teetls
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/CipherSlinger/teetls/pkg/csvattest"
 )
 
 // defaultTimeout bounds dialing, handshaking and attestation verification when
@@ -31,6 +34,8 @@ type Config struct {
 	EvidenceProvider EvidenceProvider
 
 	// ExpectedMeasurements is the list of accepted SM3 measurement hex strings (whitelist).
+	// Each entry must be exactly 64 hex characters, because it is compared against
+	// the 32-byte report measurement. Validate rejects any other shape.
 	ExpectedMeasurements []string
 
 	// VerifyMutualAttestation enables attestation verification of client certificates.
@@ -154,6 +159,35 @@ func (c *Config) Validate() error {
 		return errors.New("teetls: HRKCertPath and HSKCekCertPath must be configured together")
 	}
 
+	if err := validateExpectedMeasurements(c.ExpectedMeasurements); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateExpectedMeasurements rejects whitelist entries that could never match.
+//
+// A measurement is the SM3 digest of the report measurement field, so the
+// verifier compares each entry against a 64-character lowercase hex string. Any
+// entry of a different length, or one containing a non-hex character, is
+// therefore unreachable: it would silently fail every handshake with
+// ErrMeasurementMismatch, which reads as a policy rejection rather than as the
+// configuration mistake it is. Rejecting the entry here turns that into an
+// error at Dial, Listen or handshake time.
+//
+// Letter case is not constrained, because the comparison uses EqualFold.
+func validateExpectedMeasurements(measurements []string) error {
+	const wantLen = csvattest.HashSize * 2
+	for i, m := range measurements {
+		if len(m) != wantLen {
+			return fmt.Errorf("teetls: ExpectedMeasurements[%d] is %d characters, want %d hex characters (a 32-byte SM3 digest): %q",
+				i, len(m), wantLen, m)
+		}
+		if _, err := hex.DecodeString(m); err != nil {
+			return fmt.Errorf("teetls: ExpectedMeasurements[%d] is not valid hex: %q: %w", i, m, err)
+		}
+	}
 	return nil
 }
 

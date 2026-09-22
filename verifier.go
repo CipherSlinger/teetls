@@ -70,6 +70,12 @@ func normalizedVerifyConfig(cfg *Config) (*Config, error) {
 	if (copyCfg.HRKCertPath == "") != (copyCfg.HSKCekCertPath == "") {
 		return nil, errors.New("teetls: HRKCertPath and HSKCekCertPath must be configured together")
 	}
+	// Verified through the same rule Config.Validate applies, so that callers who
+	// reach this exported function without going through Validate still get a
+	// config error rather than a confusing measurement mismatch.
+	if err := validateExpectedMeasurements(copyCfg.ExpectedMeasurements); err != nil {
+		return nil, err
+	}
 	if len(copyCfg.TrustedHRKCert) == 0 {
 		if provider, ok := copyCfg.EvidenceProvider.(TrustedHRKProvider); ok {
 			copyCfg.TrustedHRKCert = provider.TrustedHRKCert()

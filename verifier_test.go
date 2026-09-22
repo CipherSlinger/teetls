@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -191,10 +192,13 @@ func TestVerifyPeerCertificate_InsecureSkip(t *testing.T) {
 		t.Fatalf("GenerateSM2CertificateWithEvidence failed: %v", err)
 	}
 
+	// Deliberately a well-formed measurement that does not match the mock
+	// provider's, so that the test shows InsecureSkipAttestationVerify bypassing
+	// a real measurement mismatch rather than a malformed whitelist entry.
 	cfg := &Config{
 		Mode:                          ModeStrict,
 		InsecureSkipAttestationVerify: true,
-		ExpectedMeasurements:          []string{"non-matching-measurement"},
+		ExpectedMeasurements:          []string{strings.Repeat("ab", 32)},
 	}
 
 	evidence, err := VerifyPeerCertificateAndEvidence(certPEM, cfg)
@@ -320,6 +324,71 @@ func TestConfig_Validate(t *testing.T) {
 	cfgHalfHRK := &Config{HRKCertPath: "/tmp/hrk.cert"}
 	if err := cfgHalfHRK.Validate(); err == nil {
 		t.Fatal("expected error for HRKCertPath without HSKCekCertPath, got nil")
+	}
+
+	// A well-formed whitelist, in either letter case, must be accepted: the
+	// verifier compares with EqualFold, so case cannot be constrained.
+	for _, m := range []string{
+		strings.Repeat("ab", 32),
+		strings.ToUpper(strings.Repeat("ab", 32)),
+	} {
+		cfgCase := &Config{ExpectedMeasurements: []string{m}}
+		if err := cfgCase.Validate(); err != nil {
+			t.Fatalf("expected %q to validate, got: %v", m, err)
+		}
+	}
+
+	// Whichever entry of a whitelist is malformed must be reported.
+	good := strings.Repeat("ab", 32)
+	for name, m := range map[string]string{
+		"empty":          "",
+		"too short":      "deadbeef01234567",
+		"too long":       good + "ab",
+		"non-hex":        strings.Repeat("zz", 32),
+		"0x prefix":      "0x" + good[:62],
+		"inner space":    good[:32] + " " + good[33:],
+		"trailing space": good + " ",
+	} {
+		cfgBad := &Config{ExpectedMeasurements: []string{good, m}}
+		if err := cfgBad.Validate(); err == nil {
+			t.Errorf("expected an error for a %s measurement, got nil", name)
+		}
+	}
+
+	// A measurement of exactly the right length but with one character replaced
+	// by a non-hex byte must still be caught.
+	cfgNonHex := &Config{ExpectedMeasurements: []string{good[:63] + "g"}}
+	if err := cfgNonHex.Validate(); err == nil {
+		t.Error("expected an error for a 64-character non-hex measurement, got nil")
+	}
+}
+
+// TestVerifyPeerCertificate_RejectsMalformedMeasurements verifies that the
+// measurement whitelist is validated on the verification path too, which is
+// reachable without Config.Validate.
+func TestVerifyPeerCertificate_RejectsMalformedMeasurements(t *testing.T) {
+	mockProv := NewMockEvidenceProvider()
+	certPEM, _, err := GenerateSM2CertificateWithEvidence(mockProv)
+	if err != nil {
+		t.Fatalf("GenerateSM2CertificateWithEvidence failed: %v", err)
+	}
+
+	cfg := &Config{
+		Mode:                 ModeStrict,
+		TrustedHRKCert:       mockProv.TrustedHRKCert(),
+		ExpectedMeasurements: []string{"not-a-measurement"},
+	}
+
+	_, err = VerifyPeerCertificateAndEvidence(certPEM, cfg)
+	if err == nil {
+		t.Fatal("expected a configuration error for a malformed measurement, got nil")
+	}
+	// It must be reported as a configuration problem, not as a policy rejection.
+	if errors.Is(err, ErrMeasurementMismatch) {
+		t.Fatalf("malformed measurement reported as a mismatch rather than a config error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "ExpectedMeasurements") {
+		t.Fatalf("error does not name the offending field: %v", err)
 	}
 }
 
