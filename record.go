@@ -56,7 +56,7 @@ var (
 	ErrInvalidRecordHeader = errors.New("teetls: invalid TLS 1.3 outer record header")
 	// ErrRecordLengthMismatch is returned when outer record header length does not match payload size.
 	ErrRecordLengthMismatch = errors.New("teetls: record length in header does not match data length")
-	// ErrZeroPaddingOnly is returned when non-zero bytes are found after content type or no content type found.
+	// ErrNoContentType is returned when the decrypted inner plaintext contains no valid content type byte.
 	ErrNoContentType = errors.New("teetls: inner plaintext does not contain valid content type")
 	// ErrSequenceOverflow is returned when the 64-bit sequence number overflows.
 	ErrSequenceOverflow = errors.New("teetls: sequence number overflow")

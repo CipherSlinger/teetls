@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 
 	"github.com/CipherSlinger/teetls/pkg/csvattest"
 )
@@ -37,8 +38,10 @@ type MockEvidenceProvider struct {
 	MeasurementHex string
 	HRKCert        []byte
 	HSKCekCert     []byte
-	authority      *csvattest.MockAttestationAuthority
-	initErr        error
+
+	mu        sync.Mutex
+	authority *csvattest.MockAttestationAuthority
+	initErr   error
 }
 
 // NewMockEvidenceProvider creates a new MockEvidenceProvider with default test data.
@@ -58,6 +61,30 @@ func NewMockEvidenceProvider() *MockEvidenceProvider {
 
 // GetEvidence produces a cryptographically signed mock report with UserData, Measurement, and certificate chain.
 func (m *MockEvidenceProvider) GetEvidence(pubKeyDigest [32]byte) (*CSVEvidenceExtension, error) {
+	authority, err := m.attestationAuthority()
+	if err != nil {
+		return nil, err
+	}
+
+	report, hrkCert, hskCekCert, err := authority.Generate(pubKeyDigest[:], m.MeasurementHex)
+	if err != nil {
+		return nil, fmt.Errorf("generate mock attestation data: %w", err)
+	}
+
+	return &CSVEvidenceExtension{
+		Version:    1,
+		Report:     report,
+		HRKCert:    hrkCert,
+		HSKCekCert: hskCekCert,
+	}, nil
+}
+
+// attestationAuthority returns the shared mock authority, creating it on first
+// use when construction failed so that concurrent callers cannot race on it.
+func (m *MockEvidenceProvider) attestationAuthority() (*csvattest.MockAttestationAuthority, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if m.initErr != nil {
 		return nil, fmt.Errorf("initialize mock attestation authority: %w", m.initErr)
 	}
@@ -70,18 +97,7 @@ func (m *MockEvidenceProvider) GetEvidence(pubKeyDigest [32]byte) (*CSVEvidenceE
 		m.HRKCert = authority.HRKCert()
 		m.HSKCekCert = authority.HSKCekCert()
 	}
-
-	report, hrkCert, hskCekCert, err := m.authority.Generate(pubKeyDigest[:], m.MeasurementHex)
-	if err != nil {
-		return nil, fmt.Errorf("generate mock attestation data: %w", err)
-	}
-
-	return &CSVEvidenceExtension{
-		Version:    1,
-		Report:     report,
-		HRKCert:    hrkCert,
-		HSKCekCert: hskCekCert,
-	}, nil
+	return m.authority, nil
 }
 
 // GetEvidenceContext produces mock evidence and observes pre-call cancellation.
@@ -138,11 +154,25 @@ func (h *HygonHardwareProvider) TrustedHRKCert() []byte {
 	if h.HRKCertPath == "" {
 		return nil
 	}
-	data, err := os.ReadFile(h.HRKCertPath)
+	data, err := readCertFile(h.HRKCertPath, csvattest.HrkCertSize)
 	if err != nil {
 		return nil
 	}
-	return append([]byte(nil), data...)
+	return data
+}
+
+// readCertFile reads a fixed-layout Hygon certificate file and normalises it to
+// size bytes. Trailing bytes such as a newline are dropped, so that the anchor
+// comparison and the evidence encoding both see the exact certificate.
+func readCertFile(path string, size int) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) < size {
+		return nil, fmt.Errorf("certificate file %s is %d bytes, need at least %d", path, len(data), size)
+	}
+	return append([]byte(nil), data[:size]...), nil
 }
 
 // GetEvidence communicates with the hardware driver to retrieve attestation report and cert chain.
@@ -167,7 +197,7 @@ func (h *HygonHardwareProvider) GetEvidence(pubKeyDigest [32]byte) (*CSVEvidence
 
 	var hrkCert []byte
 	if h.HRKCertPath != "" {
-		data, err := os.ReadFile(h.HRKCertPath)
+		data, err := readCertFile(h.HRKCertPath, csvattest.HrkCertSize)
 		if err != nil {
 			return nil, fmt.Errorf("read hrk cert: %w", err)
 		}
@@ -176,7 +206,7 @@ func (h *HygonHardwareProvider) GetEvidence(pubKeyDigest [32]byte) (*CSVEvidence
 
 	var hskCekCert []byte
 	if h.HSKCekCertPath != "" {
-		data, err := os.ReadFile(h.HSKCekCertPath)
+		data, err := readCertFile(h.HSKCekCertPath, csvattest.HskCekSize)
 		if err != nil {
 			return nil, fmt.Errorf("read hsk_cek cert: %w", err)
 		}

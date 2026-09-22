@@ -32,6 +32,16 @@ var (
 	ErrCertificateNotYetValid = errors.New("peer certificate is not yet valid")
 )
 
+// normalizeHRKCert returns the fixed-layout Hygon root certificate contained in
+// cert, or nil when the material is too short to be one. Trailing bytes (for
+// example a newline from a file read) must not affect anchor comparison.
+func normalizeHRKCert(cert []byte) []byte {
+	if len(cert) < csvattest.HrkCertSize {
+		return nil
+	}
+	return cert[:csvattest.HrkCertSize]
+}
+
 func normalizedVerifyConfig(cfg *Config) (*Config, error) {
 	if cfg == nil {
 		cfg = &Config{}
@@ -122,18 +132,35 @@ func VerifyPeerCertificateAndEvidence(peerCertPEM []byte, cfg *Config) (*CSVEvid
 		CertDir:     cfg.CertDir,
 	}
 	if len(cfg.TrustedHRKCert) > 0 {
-		opts.TrustedHRKCertBytes = cfg.TrustedHRKCert
-		if len(evidence.HRKCert) > 0 && !bytes.Equal(evidence.HRKCert, cfg.TrustedHRKCert) {
+		trusted := normalizeHRKCert(cfg.TrustedHRKCert)
+		if trusted == nil {
+			return nil, fmt.Errorf("%w: trusted HRK anchor is shorter than %d bytes", ErrInvalidEvidenceReport, csvattest.HrkCertSize)
+		}
+		opts.TrustedHRKCertBytes = trusted
+		if len(evidence.HRKCert) > 0 && !bytes.Equal(evidence.HRKCert, trusted) {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidEvidenceReport, csvattest.ErrUntrustedHRK)
 		}
 	}
-	if cfg.HRKCertPath != "" && cfg.HSKCekCertPath != "" {
+
+	// Chain material is resolved local-first: explicit paths, then a local
+	// certificate directory, and only then peer-supplied intermediates. Local
+	// material must never be shadowed by what the peer sent.
+	switch {
+	case cfg.HRKCertPath != "" && cfg.HSKCekCertPath != "":
 		opts.TrustedHRKCertPath = cfg.HRKCertPath
 		opts.HSKCekCertPath = cfg.HSKCekCertPath
-	} else if len(evidence.HSKCekCert) > 0 {
+	case cfg.CertDir != "":
+		chain, err := csvattest.LoadLocalCertChain(cfg.CertDir)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidEvidenceReport, err)
+		}
+		opts.HSKCekCertBytes = chain.HSKCEK
+		// A configured in-memory HRK anchor remains authoritative.
+		if len(opts.TrustedHRKCertBytes) == 0 {
+			opts.TrustedHRKCertBytes = chain.HRK
+		}
+	case len(evidence.HSKCekCert) > 0:
 		opts.HSKCekCertBytes = evidence.HSKCekCert
-	} else if len(cfg.TrustedHRKCert) > 0 && len(evidence.HRKCert) > 0 && len(evidence.HSKCekCert) == 0 {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidEvidenceReport, csvattest.ErrMissingCertChain)
 	}
 
 	res, err := csvattest.VerifyReportWithOptions(evidence.Report, opts)
