@@ -481,6 +481,11 @@ func TestHandshake_CoalescedServerMessages_EndToEnd(t *testing.T) {
 	}
 }
 
+// mutualFlagOffset is the byte offset of the mutual-attestation flag within the
+// plaintext ClientHello record: record header + handshake header + client
+// random + ephemeral public key.
+const mutualFlagOffset = RecordHeaderLen + HandshakeHeaderLen + RandomBytesLen + SM2UncompressedPubKeyLen
+
 // flagFlipConn rewrites the mutual-attestation flag byte in the plaintext
 // ClientHello it forwards, simulating an on-path attacker clearing the client's
 // request to attest itself. The flag travels outside the authenticated
@@ -492,12 +497,11 @@ type flagFlipConn struct {
 }
 
 func (c *flagFlipConn) Write(p []byte) (int, error) {
-	if !c.flipped && len(p) > RecordHeaderLen &&
+	if !c.flipped && len(p) > mutualFlagOffset &&
 		p[0] == byte(RecordTypeHandshake) && p[RecordHeaderLen] == HandshakeTypeClientHello {
 		c.flipped = true
 		buf := append([]byte(nil), p...)
-		// The mutual-attestation flag is the final byte of the ClientHello record.
-		buf[len(buf)-1] = 0
+		buf[mutualFlagOffset] = 0
 		_, err := c.Conn.Write(buf)
 		return len(p), err
 	}

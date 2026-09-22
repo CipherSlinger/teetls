@@ -320,22 +320,11 @@ func (t *handshakeTranscript) Write(msgType uint8, body []byte) {
 	t.buf.Write(encodeHandshakeMsg(msgType, body))
 }
 
-// WriteRaw appends already-encoded handshake bytes. ClientHello and ServerHello
-// are read from the record layer as wire bytes, so they bypass Write's header
-// encoding.
-func (t *handshakeTranscript) WriteRaw(wire []byte) {
-	t.buf.Write(wire)
-}
-
-// Bytes returns the accumulated transcript.
+// Bytes returns the accumulated transcript as a zero-copy view valid until the
+// next Write. Callers that sign or HMAC must consume it before mutating the
+// transcript, which every current use does.
 func (t *handshakeTranscript) Bytes() []byte {
 	return t.buf.Bytes()
-}
-
-// Snapshot returns a copy of the accumulated transcript, stable against later
-// writes, for use as the CertificateVerify or Finished signing input.
-func (t *handshakeTranscript) Snapshot() []byte {
-	return append([]byte(nil), t.buf.Bytes()...)
 }
 
 // Hash returns the SM3 digest of the accumulated transcript.
@@ -344,17 +333,16 @@ func (t *handshakeTranscript) Hash() []byte {
 	return sum[:]
 }
 
-// prepareCertificate resolves or generates an SM2 certificate and private key
-// for the given handshake role, labelling errors with that role. Both peers use
-// the same path; only the label differs.
-func prepareCertificate(ctx context.Context, cfg *Config, role string) (certPEM []byte, privKey *sm2.PrivateKey, err error) {
+// prepareCertificate resolves or generates an SM2 certificate and private key.
+// Callers label any error with their own role.
+func prepareCertificate(ctx context.Context, cfg *Config) (certPEM []byte, privKey *sm2.PrivateKey, err error) {
 	certPEM, keyPEM, err := cfg.GetOrGenerateCertificateContext(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("prepare %s certificate: %w", role, err)
+		return nil, nil, fmt.Errorf("get or generate certificate: %w", err)
 	}
 	priv, err := gx509.ReadPrivateKeyFromPem(keyPEM, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read %s private key: %w", role, err)
+		return nil, nil, fmt.Errorf("read private key: %w", err)
 	}
 	return certPEM, priv, nil
 }
@@ -399,17 +387,16 @@ func ClientHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 	}
 
 	// Send ClientHello wrapped in TLSPlaintext record
-	clientHelloWire, err := writePlaintextHandshakeMsg(rawConn, HandshakeTypeClientHello, clientHelloBody)
-	if err != nil {
+	if _, err := writePlaintextHandshakeMsg(rawConn, HandshakeTypeClientHello, clientHelloBody); err != nil {
 		return nil, fmt.Errorf("teetls: send ClientHello: %w", err)
 	}
 
 	// Initialize the transcript with the ClientHello.
 	transcript := &handshakeTranscript{}
-	transcript.WriteRaw(clientHelloWire)
+	transcript.Write(HandshakeTypeClientHello, clientHelloBody)
 
 	// 2. Read ServerHello wrapped in TLSPlaintext record
-	msgType, serverHelloBody, serverHelloWire, err := readPlaintextHandshakeMsg(rawConn)
+	msgType, serverHelloBody, _, err := readPlaintextHandshakeMsg(rawConn)
 	if err != nil {
 		return nil, fmt.Errorf("teetls: read ServerHello: %w", err)
 	}
@@ -427,7 +414,7 @@ func ClientHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 		return nil, fmt.Errorf("teetls: decode server ephemeral public key: %w", err)
 	}
 
-	transcript.WriteRaw(serverHelloWire)
+	transcript.Write(HandshakeTypeServerHello, serverHelloBody)
 
 	// 3. Compute ECDHE shared secret & derive handshake traffic keys
 	sharedSecret, err := computeECDHESharedSecret(serverEphemeralPub, clientEphemeralPriv)
@@ -500,8 +487,8 @@ func ClientHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 		return nil, fmt.Errorf("teetls: server certificate public key error: %w", err)
 	}
 
-	// Snapshot the transcript before CertificateVerify.
-	transcriptForVerify := transcript.Snapshot()
+	// Verify the server signature over the transcript prior to CertificateVerify.
+	transcriptForVerify := transcript.Bytes()
 
 	// 6. Read CertificateVerify (encrypted)
 	msgType, sigBody, err := hsReader.ReadMsg()
@@ -518,8 +505,8 @@ func ClientHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 	}
 	transcript.Write(HandshakeTypeCertificateVerify, sigBody)
 
-	// Snapshot the transcript before the server Finished.
-	transcriptForServerFinished := transcript.Snapshot()
+	// Compute the expected server Finished over the transcript prior to Finished.
+	transcriptForServerFinished := transcript.Bytes()
 
 	// 7. Read Server Finished (encrypted)
 	msgType, finishedBody, err := hsReader.ReadMsg()
@@ -542,7 +529,7 @@ func ClientHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 
 	// 8. If mutual attestation is negotiated, send Client Certificate & CertificateVerify
 	if mutualRequired {
-		clientCertPEM, clientPriv, err := prepareCertificate(ctx, cfg, "client")
+		clientCertPEM, clientPriv, err := prepareCertificate(ctx, cfg)
 		if err != nil {
 			return nil, fmt.Errorf("teetls: prepare client certificate: %w", err)
 		}
@@ -625,13 +612,13 @@ func ServerHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 	defer func() { _ = rawConn.SetDeadline(time.Time{}) }()
 
 	// Prepare server SM2 certificate and private key
-	serverCertPEM, serverPriv, err := prepareCertificate(ctx, cfg, "server")
+	serverCertPEM, serverPriv, err := prepareCertificate(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("teetls: prepare server certificate: %w", err)
 	}
 
 	// 1. Read ClientHello wrapped in TLSPlaintext record
-	msgType, clientHelloBody, clientHelloWire, err := readPlaintextHandshakeMsg(rawConn)
+	msgType, clientHelloBody, _, err := readPlaintextHandshakeMsg(rawConn)
 	if err != nil {
 		return nil, fmt.Errorf("teetls: read ClientHello: %w", err)
 	}
@@ -655,7 +642,7 @@ func ServerHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 	}
 
 	transcript := &handshakeTranscript{}
-	transcript.WriteRaw(clientHelloWire)
+	transcript.Write(HandshakeTypeClientHello, clientHelloBody)
 
 	// 2. Generate server ephemeral SM2 key pair and random bytes
 	serverEphemeralPriv, err := sm2.GenerateKey(rand.Reader)
@@ -675,11 +662,10 @@ func ServerHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 	copy(serverHelloBody[RandomBytesLen:], serverEphemeralPubBytes)
 
 	// Send ServerHello wrapped in TLSPlaintext record
-	serverHelloWire, err := writePlaintextHandshakeMsg(rawConn, HandshakeTypeServerHello, serverHelloBody)
-	if err != nil {
+	if _, err := writePlaintextHandshakeMsg(rawConn, HandshakeTypeServerHello, serverHelloBody); err != nil {
 		return nil, fmt.Errorf("teetls: send ServerHello: %w", err)
 	}
-	transcript.WriteRaw(serverHelloWire)
+	transcript.Write(HandshakeTypeServerHello, serverHelloBody)
 
 	// 3. Compute ECDHE shared secret & derive handshake traffic keys
 	sharedSecret, err := computeECDHESharedSecret(clientEphemeralPub, serverEphemeralPriv)
@@ -774,8 +760,8 @@ func ServerHandshakeContext(ctx context.Context, rawConn net.Conn, cfg *Config) 
 			return nil, fmt.Errorf("teetls: client certificate public key error: %w", err)
 		}
 
-		// Snapshot the transcript before the client CertificateVerify.
-		clientTranscriptForVerify := transcript.Snapshot()
+		// Verify the client signature over the transcript prior to CertificateVerify.
+		clientTranscriptForVerify := transcript.Bytes()
 
 		// Read client CertificateVerify
 		msgType, clientSigBody, err := hsReader.ReadMsg()
