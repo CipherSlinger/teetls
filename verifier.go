@@ -43,6 +43,7 @@ func normalizedVerifyConfig(cfg *Config) (*Config, error) {
 		VerifyMutualAttestation:       cfg.VerifyMutualAttestation,
 		Timeout:                       cfg.Timeout,
 		InsecureSkipAttestationVerify: cfg.InsecureSkipAttestationVerify,
+		SkipChainVerify:               cfg.SkipChainVerify,
 		CertPEM:                       append([]byte(nil), cfg.CertPEM...),
 		KeyPEM:                        append([]byte(nil), cfg.KeyPEM...),
 		HRKCertPath:                   cfg.HRKCertPath,
@@ -117,23 +118,27 @@ func VerifyPeerCertificateAndEvidence(peerCertPEM []byte, cfg *Config) (*CSVEvid
 	}
 
 	// 1. Verify PEK report signature and certificate chain.
+	// SkipChainVerify keeps step 1's PEK check and drops only the anchoring
+	// that follows it, so no trust anchor is selected or compared here.
 	opts := csvattest.VerifyOptions{
-		VerifyChain: true,
+		VerifyChain: !cfg.SkipChainVerify,
 		CertDir:     cfg.CertDir,
 	}
-	if len(cfg.TrustedHRKCert) > 0 {
-		opts.TrustedHRKCertBytes = cfg.TrustedHRKCert
-		if len(evidence.HRKCert) > 0 && !bytes.Equal(evidence.HRKCert, cfg.TrustedHRKCert) {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidEvidenceReport, csvattest.ErrUntrustedHRK)
+	if !cfg.SkipChainVerify {
+		if len(cfg.TrustedHRKCert) > 0 {
+			opts.TrustedHRKCertBytes = cfg.TrustedHRKCert
+			if len(evidence.HRKCert) > 0 && !bytes.Equal(evidence.HRKCert, cfg.TrustedHRKCert) {
+				return nil, fmt.Errorf("%w: %v", ErrInvalidEvidenceReport, csvattest.ErrUntrustedHRK)
+			}
 		}
-	}
-	if cfg.HRKCertPath != "" && cfg.HSKCekCertPath != "" {
-		opts.TrustedHRKCertPath = cfg.HRKCertPath
-		opts.HSKCekCertPath = cfg.HSKCekCertPath
-	} else if len(evidence.HSKCekCert) > 0 {
-		opts.HSKCekCertBytes = evidence.HSKCekCert
-	} else if len(cfg.TrustedHRKCert) > 0 && len(evidence.HRKCert) > 0 && len(evidence.HSKCekCert) == 0 {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidEvidenceReport, csvattest.ErrMissingCertChain)
+		if cfg.HRKCertPath != "" && cfg.HSKCekCertPath != "" {
+			opts.TrustedHRKCertPath = cfg.HRKCertPath
+			opts.HSKCekCertPath = cfg.HSKCekCertPath
+		} else if len(evidence.HSKCekCert) > 0 {
+			opts.HSKCekCertBytes = evidence.HSKCekCert
+		} else if len(cfg.TrustedHRKCert) > 0 && len(evidence.HRKCert) > 0 && len(evidence.HSKCekCert) == 0 {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidEvidenceReport, csvattest.ErrMissingCertChain)
+		}
 	}
 
 	res, err := csvattest.VerifyReportWithOptions(evidence.Report, opts)

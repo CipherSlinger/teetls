@@ -38,6 +38,17 @@ type Config struct {
 	// InsecureSkipAttestationVerify bypasses attestation verification (for testing only).
 	InsecureSkipAttestationVerify bool
 
+	// SkipChainVerify keeps the checks that do not need a trust anchor but
+	// skips the HRK -> HSK/CEK certificate chain behind the report's PEK
+	// certificate. The report is then accepted on its own internal
+	// consistency - the PEK certificate carried inside it signed the report
+	// body - without proving that certificate descends from a vendor root.
+	// The public-key binding and measurement checks still run. Unlike
+	// InsecureSkipAttestationVerify this does not disable attestation, only
+	// its anchoring, so it is the switch for a deployment that cannot supply
+	// the vendor certificates.
+	SkipChainVerify bool
+
 	// CertPEM and KeyPEM hold optional pre-generated SM2 certificate and private key in PEM format.
 	CertPEM []byte
 	KeyPEM  []byte

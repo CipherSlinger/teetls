@@ -520,3 +520,87 @@ func TestVerifyPeerCertificate_TamperedCertChain(t *testing.T) {
 		t.Fatalf("expected ErrInvalidEvidenceReport, got: %v", err)
 	}
 }
+
+// peerCertWithEvidence builds a peer certificate carrying ev, signed by priv,
+// so a test can hand a deliberately broken report or cert chain to the
+// verifier. The key is the caller's because the verifier checks that the
+// certificate's public key matches the digest the evidence was produced for.
+func peerCertWithEvidence(t *testing.T, ev *CSVEvidenceExtension, priv *sm2.PrivateKey) []byte {
+	t.Helper()
+
+	ext, err := EncodeCSVEvidence(ev)
+	if err != nil {
+		t.Fatalf("encode evidence: %v", err)
+	}
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, _ := rand.Int(rand.Reader, serialNumberLimit)
+	template := &gx509.Certificate{
+		SerialNumber:          serialNumber,
+		Subject:               pkix.Name{CommonName: "Test Evidence Peer"},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              gx509.KeyUsageDigitalSignature | gx509.KeyUsageKeyEncipherment,
+		BasicConstraintsValid: true,
+		ExtraExtensions:       []pkix.Extension{ext},
+	}
+	certPEM, err := gx509.CreateCertificateToPem(template, template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	return certPEM
+}
+
+// TestVerifyPeerCertificate_SkipChainVerify pins the PEK-only mode: a broken
+// HRK -> HSK/CEK chain is accepted, while the PEK signature over the report
+// body is still enforced.
+func TestVerifyPeerCertificate_SkipChainVerify(t *testing.T) {
+	newEvidence := func(t *testing.T) (*MockEvidenceProvider, *sm2.PrivateKey, *CSVEvidenceExtension) {
+		t.Helper()
+		mockProv := NewMockEvidenceProvider()
+		priv, err := sm2.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("generate sm2 key: %v", err)
+		}
+		pubDER, err := gx509.MarshalPKIXPublicKey(&priv.PublicKey)
+		if err != nil {
+			t.Fatalf("marshal pubkey: %v", err)
+		}
+		ev, err := mockProv.GetEvidence(ComputePublicKeySM3(pubDER))
+		if err != nil {
+			t.Fatalf("get evidence: %v", err)
+		}
+		return mockProv, priv, ev
+	}
+	cfgFor := func(mockProv *MockEvidenceProvider) *Config {
+		return &Config{
+			Mode:                 ModeStrict,
+			SkipChainVerify:      true,
+			TrustedHRKCert:       mockProv.TrustedHRKCert(),
+			ExpectedMeasurements: []string{mockProv.GetMeasurementHex()},
+		}
+	}
+
+	t.Run("tampered chain is accepted", func(t *testing.T) {
+		mockProv, priv, ev := newEvidence(t)
+		ev.HSKCekCert[20] ^= 0xff
+		certPEM := peerCertWithEvidence(t, ev, priv)
+
+		if _, err := VerifyPeerCertificateAndEvidence(certPEM, cfgFor(mockProv)); err != nil {
+			t.Fatalf("PEK-only mode rejected a tampered chain: %v", err)
+		}
+	})
+
+	t.Run("tampered PEK signature is still rejected", func(t *testing.T) {
+		mockProv, priv, ev := newEvidence(t)
+		ev.Report[0x0c0+10] ^= 0xff
+		certPEM := peerCertWithEvidence(t, ev, priv)
+
+		_, err := VerifyPeerCertificateAndEvidence(certPEM, cfgFor(mockProv))
+		if err == nil {
+			t.Fatal("expected the PEK signature check to still reject a tampered report")
+		}
+		if !errors.Is(err, ErrInvalidEvidenceReport) {
+			t.Fatalf("expected ErrInvalidEvidenceReport, got: %v", err)
+		}
+	})
+}
