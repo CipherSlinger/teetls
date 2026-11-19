@@ -75,6 +75,13 @@ type Config struct {
 	cachedNotAfter time.Time
 }
 
+// DefaultHRKCertPath and DefaultHSKCekCertPath are where the packaging paths
+// install the local vendor chain (deploy/certs copied to /root/taa/certs).
+const (
+	DefaultHRKCertPath    = "/root/taa/certs/hrk.cert"
+	DefaultHSKCekCertPath = "/root/taa/certs/hsk_cek.cert"
+)
+
 // GetOrGenerateCertificate retrieves the cached certificate/key or generates a new one.
 func (c *Config) GetOrGenerateCertificate() ([]byte, []byte, error) {
 	return c.GetOrGenerateCertificateContext(context.Background())
